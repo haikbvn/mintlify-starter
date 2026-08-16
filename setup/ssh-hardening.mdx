@@ -55,7 +55,7 @@ From your admin machine, push the public key to the server using `ssh-copy-id`:
 ssh-copy-id <admin-user>@<server-lan-ip>
 ```
 
-Replace `<admin-user>` with your admin username (for example `hainguyen`) and `<server-lan-ip>` with the server's static LAN IP (for example `192.168.1.74`).
+Replace `<admin-user>` with your admin username (for example `misadmin`) and `<server-lan-ip>` with the server's static LAN IP (for example `192.168.1.74`).
 
 `ssh-copy-id` will:
 1. Prompt you for the admin user's **password** (the one set during installation)
@@ -161,7 +161,7 @@ On your admin workstation, add a host entry to `~/.ssh/config` to avoid typing t
 ```
 Host mis-server
     HostName 192.168.1.74
-    User hainguyen
+    User misadmin
     IdentityFile ~/.ssh/mis-server
     ServerAliveInterval 60
     ServerAliveCountMax 3

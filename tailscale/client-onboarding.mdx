@@ -1,7 +1,7 @@
 ---
 title: "MIS Client Onboarding and Offboarding with Tailscale"
 sidebarTitle: "Client Onboarding"
-description: "Step-by-step guide to enrolling new MIS workstations in the Tailscale tailnet, assigning the correct tag, validating SQL connectivity, and safely revoking access."
+description: "Enroll MIS workstations into the Tailscale tailnet, assign the mis-client tag, validate TCP 1433 connectivity, and revoke access for departing machines."
 ---
 
 Every MIS client machine that needs to reach the production SQL Server must be enrolled in the Tailscale tailnet and assigned the `tag:mis-client` tag. The existing ACL grant automatically extends TCP 1433 access to any machine carrying that tag — you never need to modify the ACL policy to add a new client. This page covers the full lifecycle: enrolling a new machine, verifying connectivity, revoking a departing machine, and managing admin access.

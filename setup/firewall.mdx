@@ -1,7 +1,7 @@
 ---
-title: "Configuring UFW Firewall Rules for the MIS Server"
+title: "UFW Firewall Configuration for the MIS Production Server"
 sidebarTitle: "Firewall"
-description: "Apply deny-by-default UFW rules that restrict SSH and SQL Server access to trusted LAN CIDRs and the Tailscale interface, keeping port 1433 off the internet."
+description: "Configure UFW deny-by-default rules that restrict SSH and SQL Server to trusted LAN CIDRs and the Tailscale interface, keeping port 1433 off the internet."
 ---
 
 UFW (Uncomplicated Firewall) is the host-based firewall you use to enforce the MIS server's network security policy. The default rule is simple: deny all inbound traffic, allow all outbound. You then carve out the minimum set of inbound exceptions needed for MIS clients and administrator access. Nothing else gets in.

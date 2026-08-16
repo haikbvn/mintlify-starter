@@ -131,12 +131,12 @@ SQL Server Express has hard resource limits that cannot be changed by configurat
     The buffer pool is capped at approximately **1,410 MB**. Memory pressure will increase disk I/O.
   </Card>
   <Card title="Database Size" icon="hard-drive">
-    Each user database is limited to **10 GB** of data files. Log files are not counted against this limit.
+    Each user database is limited to **50 GB** of data files. Log files are not counted against this limit.
   </Card>
 </CardGroup>
 
 <Warning>
-  The 10 GB data file limit per database is a hard ceiling for SQL Server Express. If your MIS database approaches this limit, queries will begin to fail with a capacity error. Plan to monitor growth regularly and engage your vendor or DBA before you approach the limit.
+  The 50 GB data file limit per database is a hard ceiling for SQL Server 2025 Express. If your MIS database approaches this limit, queries will begin to fail with a capacity error. Plan to monitor growth regularly and engage your vendor or DBA well before you approach the limit.
 </Warning>
 
 Run the following query to check current database sizes at any time:
@@ -152,7 +152,7 @@ GO
 ```
 
 <Tip>
-  Schedule this query as a SQL Server Agent job or a cron-driven `sqlcmd` script to alert you when any database exceeds 8 GB — giving you time to act before hitting the 10 GB ceiling.
+  Schedule this query as a SQL Server Agent job or a cron-driven `sqlcmd` script to alert you when any database exceeds 40 GB — giving you time to act before hitting the 50 GB ceiling.
 </Tip>
 
 ## Security Checklist

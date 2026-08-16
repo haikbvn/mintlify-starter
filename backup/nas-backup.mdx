@@ -1,5 +1,5 @@
 ---
-title: "NAS Backup Mount, Copy, and Retention Policy"
+title: "NAS Backup: Mount, Copy, and Retention for MIS Server"
 sidebarTitle: "NAS Backup"
 description: "Mount a CIFS/SMB NAS share, validate mssql write access, configure off-server backup copies, and apply a tiered daily/weekly/monthly retention policy."
 ---
@@ -14,7 +14,7 @@ The NAS must **not** be your only backup location. If the NAS device and the pro
 
 The backup pipeline enforces a strict ordering: SQL Server writes the `.bak` file locally, `RESTORE VERIFYONLY` passes, and only then does `rsync` copy the verified file to the NAS. You never copy a file that SQL Server is still writing, and you never copy a file that failed verification.
 
-```
+```text
 SQL Server → local .bak → VERIFY PASS → rsync → NAS
 ```
 
@@ -79,7 +79,7 @@ SQL Server → local .bak → VERIFY PASS → rsync → NAS
   <Step title="Add a persistent fstab entry">
     Open `/etc/fstab` and append the following line, replacing the placeholder values with your NAS host, share name, and the UID/GID from the previous step:
 
-    ```
+    ```text
     //<nas-host>/<share> /mnt/mis-nas cifs \
       credentials=/root/.smb-mis-nas-credentials,\
       uid=<mssql_uid>,gid=<mssql_gid>,\

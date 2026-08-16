@@ -11,7 +11,7 @@ Ubuntu Server 24.04 LTS is the foundation every other component in this stack de
 - A USB drive (≥ 4 GB) flashed with the [Ubuntu Server 24.04 LTS ISO](https://ubuntu.com/download/server) (64-bit x86-64)
 - Physical or iDRAC/iLO console access to the server
 - The hostname you will assign: `mis-server`
-- A username for the dedicated admin account (for example, `hainguyen`)
+- A username for the dedicated admin account (for example, `misadmin`)
 - Your planned static IP, gateway, and DNS values (you can use DHCP during install and switch to static afterwards)
 
 <Note>
@@ -60,7 +60,7 @@ Download the **Server** ISO, not the Desktop ISO. The Desktop edition installs a
     mis-server
     ```
 
-    Enter the admin username (for example `hainguyen`) and a strong password. You will disable password-based SSH login after setting up key authentication, but you need a password for local console access.
+    Enter the admin username (for example `misadmin`) and a strong password. You will disable password-based SSH login after setting up key authentication, but you need a password for local console access.
 
     <Note>
     Choose a real username specific to your organisation, not a generic name like `admin` or `ubuntu`. The username becomes part of audit logs and SSH authorisation records.
