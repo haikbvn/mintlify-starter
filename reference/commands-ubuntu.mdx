@@ -1,0 +1,219 @@
+---
+title: "Ubuntu & Network Command Reference for MIS Server"
+sidebarTitle: "Ubuntu Commands"
+description: "Copy-ready bash commands for Ubuntu system inspection, Netplan static IP, SSH hardening, and UFW firewall configuration on your MIS production server."
+---
+
+This page collects every Ubuntu-level shell command used during MIS server setup and routine operations. Commands are grouped by task so you can jump directly to what you need — whether you are doing initial provisioning, adjusting the network, or tightening SSH access. Run all commands that require elevated privileges with `sudo` or from a root shell opened via `sudo -i`.
+
+## System Inspection
+
+Use these commands to confirm hardware architecture, OS release, disk layout, memory, and overall service health before you touch anything else.
+
+```bash
+# Open a root shell
+sudo -i
+
+# Confirm CPU architecture (expect x86_64)
+uname -m
+
+# Show OS release details
+lsb_release -a
+
+# List block devices with filesystem labels and UUIDs
+lsblk -f
+
+# Show memory and swap at a glance
+free -h
+
+# List any failed systemd units
+systemctl --failed
+```
+
+## Timezone and NTP
+
+Set the server clock to the correct timezone and enable NTP synchronisation. MIS backup timestamps and SQL Server transaction logs depend on an accurate system clock.
+
+```bash
+# Set timezone to Ho Chi Minh City (UTC+7)
+sudo timedatectl set-timezone Asia/Ho_Chi_Minh
+
+# Enable NTP synchronisation
+sudo timedatectl set-ntp true
+
+# Confirm current time, timezone, and NTP status
+timedatectl status
+
+# Show detailed NTP sync status
+timedatectl timesync-status
+```
+
+## System Updates
+
+Keep the OS fully patched before installing any server software.
+
+```bash
+sudo apt update && sudo apt full-upgrade -y
+```
+
+## Essential Tooling
+
+Install the utilities referenced throughout this runbook in a single pass.
+
+```bash
+sudo apt install -y \
+  curl wget ca-certificates gnupg lsb-release \
+  vim nano htop tmux jq unzip rsync \
+  smartmontools nvme-cli dnsutils net-tools nmap \
+  cifs-utils
+```
+
+## Swap Inspection
+
+Verify that swap is present and active. SQL Server benefits from at least some swap headroom.
+
+```bash
+swapon --show
+```
+
+## Kernel and Service Logs
+
+Review boot-time errors and warnings before proceeding with any installation step.
+
+```bash
+# Show error-level (priority 3 and above) messages from the current boot
+journalctl -p 3 -b --no-pager
+```
+
+---
+
+## Static IP with Netplan
+
+Replace the placeholder values with your actual network details before applying the configuration.
+
+<Warning>
+  Run `sudo netplan try` before `sudo netplan apply`. It automatically reverts after 120 seconds if you lose connectivity, protecting you from locking yourself out.
+</Warning>
+
+Create or overwrite `/etc/netplan/01-mis-server.yaml` with the following content:
+
+```yaml
+# /etc/netplan/01-mis-server.yaml
+# Replace all placeholder values with your real network details.
+network:
+  version: 2
+  ethernets:
+    enp1s0:                        # Replace with your actual NIC name (check: ip link)
+      dhcp4: false
+      addresses: [192.168.1.74/24] # Replace with your server's static LAN IP/prefix
+      routes:
+        - to: default
+          via: 192.168.1.1         # Replace with your LAN gateway IP
+      nameservers:
+        addresses: [192.168.1.1, 1.1.1.1] # Replace with your preferred DNS resolvers
+```
+
+After saving the file, apply the configuration:
+
+```bash
+# Validate the YAML syntax
+sudo netplan generate
+
+# Apply with a 120-second auto-revert window
+sudo netplan try
+
+# Commit permanently (only after confirming connectivity)
+sudo netplan apply
+```
+
+---
+
+## SSH Setup and Hardening
+
+### Enable SSH
+
+```bash
+sudo systemctl enable --now ssh
+```
+
+### Generate an Ed25519 Admin Key
+
+Run this on your **local workstation**, not on the server.
+
+```bash
+# Replace the comment string with a label meaningful to you
+ssh-keygen -t ed25519 -a 100 -C "mis-server-admin"
+```
+
+### Copy the Public Key to the Server
+
+```bash
+# Replace <admin-user> with your Linux admin username
+# Replace <server-lan-ip> with the server's static LAN IP
+ssh-copy-id <admin-user>@<server-lan-ip>
+```
+
+### Apply SSH Hardening
+
+Create the drop-in file `/etc/ssh/sshd_config.d/99-mis-hardening.conf` with the following content:
+
+```
+PermitRootLogin no
+PasswordAuthentication no
+PubkeyAuthentication yes
+KbdInteractiveAuthentication no
+X11Forwarding no
+MaxAuthTries 3
+```
+
+<Warning>
+  Confirm you can log in with your SSH key **before** you reload SSH with `PasswordAuthentication no`. If you reload first and your key is not authorised, you will be locked out.
+</Warning>
+
+Validate and reload:
+
+```bash
+# Validate the sshd configuration — fix any errors before proceeding
+sudo sshd -t && sudo systemctl reload ssh
+```
+
+---
+
+## UFW Firewall
+
+Configure UFW to allow only the traffic your server needs. Adjust CIDR ranges and allowed sources to match your actual network layout.
+
+```bash
+# Deny all inbound traffic by default
+sudo ufw default deny incoming
+
+# Allow all outbound traffic by default
+sudo ufw default allow outgoing
+
+# Allow SSH only from your management LAN
+# Replace <management-lan-cidr> e.g. 192.168.1.0/24
+sudo ufw allow from <management-lan-cidr> to any port 22 proto tcp
+
+# Allow SQL Server only from your approved LAN segment
+# Replace <allowed-lan-cidr> e.g. 192.168.1.0/24
+sudo ufw allow from <allowed-lan-cidr> to any port 1433 proto tcp
+
+# Allow SSH over the Tailscale interface
+sudo ufw allow in on tailscale0 to any port 22 proto tcp
+
+# Allow SQL Server over the Tailscale interface
+sudo ufw allow in on tailscale0 to any port 1433 proto tcp
+
+# Enable UFW (answers "y" to the prompt)
+sudo ufw enable
+
+# Review active rules by number
+sudo ufw status numbered
+
+# Review rules with full detail
+sudo ufw status verbose
+```
+
+<Note>
+  Never open port 1433 to the Internet. All external SQL Server access must go through Tailscale.
+</Note>

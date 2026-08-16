@@ -1,0 +1,113 @@
+---
+title: "MIS Server Hardware Requirements & BIOS Setup"
+sidebarTitle: "Hardware"
+description: "Verify your physical server meets the MIS production hardware specifications and configure BIOS settings for unattended operation and power resilience."
+---
+
+The MIS production server runs 24/7 and must recover automatically from power events without manual intervention. Before you install the OS, confirm that the physical machine meets the minimum hardware requirements and that the BIOS is configured correctly. Skipping this step leads to subtle reliability problems — SQL Server crashing under memory pressure, the server failing to boot after a power outage, or disk corruption after an unexpected shutdown.
+
+## Hardware Requirements
+
+<CardGroup cols={2}>
+  <Card title="CPU" icon="microchip">
+    **x86-64 architecture required.** Minimum 4 logical cores (Intel or AMD). SQL Server 2025 Express does not support ARM. More cores improve query concurrency but Express is capped at 4 cores by the license.
+  </Card>
+  <Card title="RAM" icon="memory">
+    **16 GB recommended, 8 GB minimum.** Ubuntu + SQL Server Express at idle consumes roughly 3–5 GB. Headroom prevents the OOM killer from terminating `mssql-server` under load.
+  </Card>
+  <Card title="OS Disk" icon="hard-drive">
+    **NVMe or SATA SSD, ≥ 500 GB.** Spinning HDDs introduce unacceptable latency for SQL Server transaction log writes. NVMe is preferred. Ensure this disk is separate from any NAS or data archive.
+  </Card>
+  <Card title="Network" icon="ethernet">
+    **Wired Gigabit Ethernet NIC.** Wi-Fi is not acceptable for a production database server. Wired connectivity is required for both LAN client access and NAS backup transfers.
+  </Card>
+  <Card title="UPS" icon="bolt">
+    **Uninterruptible Power Supply with USB or network monitoring.** The UPS must be able to signal the server to perform a clean shutdown before battery runs out. Install NUT (Network UPS Tools) post-OS to handle this.
+  </Card>
+  <Card title="Form Factor" icon="server">
+    **Tower or rack-mount, your choice.** The server must be physically secured in a location with adequate ventilation. Do not run it under a desk where airflow is restricted.
+  </Card>
+</CardGroup>
+
+### Hardware Specification Summary
+
+| Component | Minimum | Recommended |
+|---|---|---|
+| CPU | x86-64, 4 logical cores | 8+ logical cores |
+| RAM | 8 GB | 16 GB |
+| OS Disk | SSD 500 GB | NVMe 500 GB+ |
+| NIC | Gigabit Ethernet | Gigabit Ethernet (wired) |
+| UPS | Any USB-monitored UPS | USB or network-managed UPS |
+
+<Note>
+SQL Server 2025 Express is licensed for a maximum of 4 CPU cores and 1,410 MB of buffer pool memory. Additional cores and RAM do not benefit SQL Server under the Express license, but they do benefit the OS and any other services running alongside it.
+</Note>
+
+## BIOS / UEFI Configuration
+
+Access your server's BIOS/UEFI setup at boot (commonly F2, Del, or F10 — consult your hardware manual). You need to verify or change four settings.
+
+<Steps>
+  <Step title="Enable UEFI Boot Mode">
+    Set the boot mode to **UEFI only**. Disable Legacy/CSM boot if present. Ubuntu Server 24.04 supports UEFI natively and Secure Boot is optional but recommended if your hardware supports it.
+
+    <Note>
+    If your server already has an OS installed in Legacy/MBR mode, do not switch to UEFI — it will stop booting. This setting applies to fresh installations only.
+    </Note>
+  </Step>
+
+  <Step title="Enable Power Restore After AC Loss">
+    Find the setting labelled **"Restore on AC Power Loss"**, **"After Power Failure"**, or similar. Set it to **"Power On"** (not "Last State" and not "Stay Off").
+
+    This ensures the server boots automatically after a power outage, even if the UPS battery was exhausted. Without this, the server sits powered-off after the utility power returns and requires a manual visit to restart.
+
+    <Warning>
+    This is one of the most commonly missed BIOS settings on new deployments. If the server does not power on automatically after a power cut, check this setting before anything else.
+    </Warning>
+  </Step>
+
+  <Step title="Disable Sleep and Hibernate">
+    Disable all sleep, suspend, and hibernate states (S1, S3, S4) in the power management section. A production database server must never suspend to disk or RAM.
+
+    Look for settings like:
+    - **"S3 Sleep State"** → Disabled
+    - **"Hibernate"** → Disabled
+    - **"ErP / EuP Power Saving"** → Disabled (this can interfere with wake-on-LAN and power restore)
+  </Step>
+
+  <Step title="Set Boot Order">
+    Set the primary boot device to the OS SSD/NVMe. Remove USB drives and optical media from the boot order (or set them lower) so the server cannot accidentally boot from a USB stick left plugged in.
+  </Step>
+</Steps>
+
+## UPS Considerations
+
+The UPS protects the server from two failure modes: short outages (the UPS supplies power for the duration) and extended outages (the UPS signals the server to shut down cleanly before the battery dies).
+
+<CardGroup cols={2}>
+  <Card title="USB-Monitored UPS" icon="usb">
+    Connect the UPS to the server via USB. After the OS is installed, install **NUT (Network UPS Tools)** to monitor battery level and trigger a clean shutdown automatically.
+  </Card>
+  <Card title="Network-Managed UPS" icon="network-wired">
+    Some UPS units expose a network management card. NUT supports these over SNMP. This is preferred for rack environments where USB cable length is impractical.
+  </Card>
+</CardGroup>
+
+<Tip>
+Test the UPS shutdown signal path during your initial setup window, not during a real outage. Pull the mains plug while the server is running and confirm that the server performs a clean shutdown before the UPS battery reaches the critical threshold.
+</Tip>
+
+## Pre-Installation Checklist
+
+Before you start the Ubuntu installation, confirm every item:
+
+- [ ] CPU is x86-64 with ≥ 4 logical cores
+- [ ] RAM is ≥ 8 GB (16 GB recommended) and seated correctly
+- [ ] OS disk is NVMe or SSD, ≥ 500 GB, and recognised in BIOS
+- [ ] Wired Gigabit NIC is connected to the LAN switch
+- [ ] UEFI boot mode is enabled
+- [ ] "Restore on AC Power Loss" is set to Power On
+- [ ] Sleep and hibernate states are disabled
+- [ ] Boot order has OS disk as primary
+- [ ] UPS is connected and the USB/network cable is in place
+- [ ] Ventilation around the server is adequate

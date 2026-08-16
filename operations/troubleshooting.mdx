@@ -1,0 +1,259 @@
+---
+title: "Layer-by-Layer MIS Server Troubleshooting Guide"
+sidebarTitle: "Troubleshooting"
+description: "Diagnose MIS and SQL Server failures layer by layer — physical through app — using targeted diagnostic commands and symptom-specific fix guidance."
+---
+
+The most common mistake when troubleshooting a production server is jumping straight to the application layer when the real problem is two levels below it. This guide follows a strict bottom-up approach: start at hardware, confirm each layer is healthy, and only move up when the layer beneath it is solid. Skipping layers wastes time and can lead you to "fix" something that was never broken.
+
+## Troubleshooting Layers
+
+Work through this table from top to bottom. Do not proceed to the next layer until the current one passes.
+
+| Layer | What to Check | If It Fails |
+|---|---|---|
+| **Physical** | BIOS POST, NIC link light, UPS status, SMART drive data | Do not touch SQL Server until hardware is stable |
+| **Ubuntu** | `systemctl --failed`, `journalctl -p 3 -b` | Fix the failing OS service before anything else |
+| **Network** | `ip route`, `ping <gateway>` | Fix Netplan configuration or check the router/switch |
+| **Tailscale** | `tailscale status`, `tailscale ping mis-server` | Check Tailscale auth key, network ACL, or re-authenticate |
+| **DNS** | Resolve `mis-server` from the client | Check MagicDNS settings in Tailscale admin console |
+| **TCP 1433** | `Test-NetConnection mis-server -Port 1433` | Check SQL Server listener and UFW rules |
+| **SQL Auth** | `sqlcmd` login | Check SQL login, password, and authentication mode |
+| **Database** | Database in `ONLINE` state, `DBCC CHECKDB` | Check restore procedure or run integrity repair |
+| **MIS App** | Login, record lookup, full workflow | Check MIS config, ODBC driver version, or app requirements |
+
+## Layer-by-Layer Diagnostic Commands
+
+Run these commands in order. Each command corresponds to a layer in the table above.
+
+```bash
+# Network layer — confirm routing and gateway reachability
+ip route
+ping -c 3 <gateway-ip>
+
+# Tailscale layer — confirm daemon and peer connectivity
+tailscale status
+tailscale ping mis-server
+
+# TCP layer — confirm SQL Server is accepting connections
+sudo ss -lntp | grep ':1433' || true
+
+# SQL Server service layer
+sudo systemctl status mssql-server --no-pager
+journalctl -u mssql-server -b --no-pager | tail -50
+
+# Firewall layer — confirm port 1433 is allowed
+sudo ufw status numbered
+```
+
+**From a Windows client workstation (PowerShell):**
+
+```powershell
+# Test TCP connectivity to SQL Server port
+Test-NetConnection mis-server -Port 1433
+
+# Test SSH port (useful to distinguish network from SQL issues)
+Test-NetConnection mis-server -Port 22
+```
+
+<Note>
+  If `Test-NetConnection -Port 22` succeeds but `-Port 1433` fails, the server is reachable over Tailscale and SSH is working. The problem is specific to SQL Server — not the network or Tailscale.
+</Note>
+
+## Common Symptoms
+
+<AccordionGroup>
+  <Accordion title="Tailscale ping works but TCP 1433 connection fails">
+    Network connectivity exists, but SQL Server is not answering on port 1433. Check the following in order:
+
+    **1. Confirm SQL Server is listening:**
+    ```bash
+    sudo ss -lntp | grep ':1433'
+    ```
+
+    If this returns nothing, SQL Server is not listening on TCP. Either the service is down, or TCP was never enabled.
+
+    **2. Check the service state:**
+    ```bash
+    sudo systemctl status mssql-server --no-pager
+    journalctl -u mssql-server -b --no-pager | tail -50
+    ```
+
+    **3. Confirm UFW allows port 1433:**
+    ```bash
+    sudo ufw status verbose
+    ```
+
+    Look for a rule allowing TCP port 1433 from the Tailscale interface (`tailscale0`) or from the appropriate subnet. If no such rule exists, add it:
+
+    ```bash
+    sudo ufw allow in on tailscale0 to any port 1433 proto tcp
+    sudo ufw reload
+    ```
+  </Accordion>
+
+  <Accordion title="TCP 1433 connects but MIS application fails">
+    The network path is fine. The problem is inside SQL Server or the MIS application configuration.
+
+    **Check SQL authentication:**
+    ```bash
+    sqlcmd -S localhost -U sa -P '<password>' -Q "SELECT @@VERSION;"
+    ```
+
+    If this fails locally, the SQL login or password is wrong — not Tailscale, not UFW.
+
+    **Verify the database is online:**
+    ```bash
+    sqlcmd -S localhost -U sa -Q "SELECT name, state_desc FROM sys.databases;"
+    ```
+
+    The MIS database should show `ONLINE`. Any other state (`RESTORING`, `SUSPECT`, `OFFLINE`) is the cause of the failure.
+
+    **Check MIS-specific issues:**
+    - Confirm the database name in the MIS configuration exactly matches what `sys.databases` returns (case may matter depending on collation)
+    - Confirm the SQL login used by MIS has the correct permissions on the target database
+    - Confirm the ODBC driver version on the client is compatible with your SQL Server version
+  </Accordion>
+
+  <Accordion title="Local sqlcmd fails on the server itself">
+    If `sqlcmd` fails when run directly on the server, the problem is entirely within SQL Server or your local credentials — Tailscale is not involved at all.
+
+    ```bash
+    # Try with explicit TCP protocol to rule out named pipes
+    sqlcmd -S tcp:localhost,1433 -U sa -P '<password>' -Q "SELECT 1;"
+    ```
+
+    If this fails, check the SQL Server error log:
+
+    ```bash
+    sudo cat /var/opt/mssql/log/errorlog | tail -50
+    ```
+
+    Common causes include: wrong password for `sa`, `sa` account disabled, SQL Server in single-user mode, or the service not fully started yet.
+  </Accordion>
+
+  <Accordion title="Automated backup fails">
+    A failing backup script is a silent risk that grows worse with time. Check each of these:
+
+    **1. Verify the database name is correct in your script:**
+    ```bash
+    sqlcmd -S localhost -U sa -Q "SELECT name FROM sys.databases;"
+    ```
+
+    **2. Check available disk space:**
+    ```bash
+    df -h /var/opt/mssql/backups
+    ```
+
+    A full filesystem is the most common cause of backup failures. If space is low, clean up old `.bak` files immediately.
+
+    **3. Confirm the backup directory exists and is writable:**
+    ```bash
+    ls -ld /var/opt/mssql/backups
+    ```
+
+    SQL Server runs as the `mssql` user. The backup directory must be owned by or writable to that user.
+
+    **4. Test the backup command manually:**
+    ```bash
+    sqlcmd -S localhost -U sa -Q "BACKUP DATABASE [YourDatabase] TO DISK = N'/var/opt/mssql/backups/manual_test.bak' WITH COMPRESSION, STATS = 10;"
+    ```
+
+    Replace `YourDatabase` with your actual database name. If this succeeds manually but fails in the script, the issue is in your credential mechanism (how the script authenticates to `sqlcmd`).
+  </Accordion>
+
+  <Accordion title="NAS is offline or unreachable">
+    NAS unavailability must never stop SQL Server or the local backup job. Treat these as two independent concerns.
+
+    **Local backup must still run.** If your backup script exits early when the NAS is unreachable, fix the script to separate the local backup step from the NAS copy step. The local `.bak` file is your primary backup; the NAS copy is secondary redundancy.
+
+    **Check NAS reachability:**
+    ```bash
+    ping -c 3 <nas-ip>
+    ```
+
+    Check your NAS copy logs for the actual error. Common causes include: NAS rebooted (DHCP lease changed its IP), SMB/NFS mount expired, or NAS credentials rotated.
+
+    **Remount if needed:**
+    ```bash
+    sudo mount -a
+    ```
+
+    Then confirm the mount is present:
+    ```bash
+    df -h | grep nas
+    ```
+  </Accordion>
+
+  <Accordion title="Disk is nearly full — approaching 85%">
+    Do not apply updates or make any other changes until you resolve the disk space issue. A full filesystem during an update can corrupt packages and leave the system in an inconsistent state.
+
+    **Identify what is consuming space:**
+    ```bash
+    df -h
+    sudo du -xhd1 /var | sort -h
+    sudo du -xhd1 /var/opt/mssql | sort -h
+    ```
+
+    **Common culprits and fixes:**
+
+    - **Old backup files:** Remove `.bak` files older than your retention window from `/var/opt/mssql/backups/`. Tighten your retention script to run more aggressively.
+    - **Transaction log growth:** If `.ldf` files are unexpectedly large, check whether log backups are running. If the recovery model is `FULL` and log backups are not running, the log cannot be truncated.
+    - **SQL Server error logs:** Multiple large `errorlog.*` files in `/var/opt/mssql/log/` can accumulate; cycle them if needed.
+    - **APT cache:** `sudo apt clean` recovers space used by cached package files.
+
+    After clearing space, confirm you are below 70% before proceeding with any other work:
+    ```bash
+    df -h
+    ```
+  </Accordion>
+
+  <Accordion title="Server did not boot after a power outage">
+    If the server does not come back automatically after AC power is restored:
+
+    1. **Check the UPS:** Confirm the UPS itself powered back on and is providing output. Some UPS models require a manual restart after a deep discharge.
+    2. **Check the BIOS setting:** The "Restore on AC Loss" or "Power Restore" BIOS option may not be enabled. Enter BIOS setup and enable it — see [UPS Graceful Shutdown](/operations/ups-shutdown) for details.
+    3. **Check for filesystem errors:** If the server shut down uncleanly (e.g., UPS battery was exhausted before shutdown completed), Ubuntu may boot into emergency mode for a filesystem check. Connect a monitor and keyboard to see the console output.
+
+    After a manual restart, run the full [Post-Reboot Verification](/operations/maintenance#post-reboot-verification) checklist before allowing users back in.
+  </Accordion>
+
+  <Accordion title="A systemd unit is in a failed state">
+    `systemctl --failed` showing any entries means something stopped unexpectedly. Never ignore this, even if MIS appears to be working — a failed unit can be masking a deeper issue.
+
+    ```bash
+    # List all failed units
+    systemctl --failed
+
+    # View detailed status and recent logs for a specific unit
+    sudo systemctl status <unit-name> --no-pager
+    journalctl -u <unit-name> -b --no-pager | tail -50
+    ```
+
+    Replace `<unit-name>` with the unit shown in `systemctl --failed`. After diagnosing and fixing the root cause, reset the failed state:
+
+    ```bash
+    sudo systemctl reset-failed <unit-name>
+    ```
+  </Accordion>
+</AccordionGroup>
+
+## Quick Reference: Full Layer Sweep
+
+Use this block when you need to run a complete diagnostic sweep and capture all output in one shot:
+
+```bash
+echo "=== Uptime ===" && uptime
+echo "=== Failed Units ===" && systemctl --failed
+echo "=== Recent Errors ===" && journalctl -p 3 -b --no-pager | tail -20
+echo "=== Network Routes ===" && ip route
+echo "=== Tailscale Status ===" && tailscale status
+echo "=== TCP 1433 Listener ===" && sudo ss -lntp | grep ':1433' || echo "NOT LISTENING"
+echo "=== SQL Server Status ===" && systemctl is-active mssql-server
+echo "=== UFW Status ===" && sudo ufw status verbose
+echo "=== Disk Usage ===" && df -h
+```
+
+<Tip>
+  Paste this sweep into a file as `~/diagnostic-sweep.sh` and `chmod +x` it. When something is wrong and you need to share information with a colleague or support contact, run the script and share the full output — it captures every layer in under five seconds.
+</Tip>

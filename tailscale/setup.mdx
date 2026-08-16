@@ -1,0 +1,177 @@
+---
+title: "Tailscale VPN Setup on Ubuntu Server"
+sidebarTitle: "Server Setup"
+description: "Install and configure Tailscale on your MIS Ubuntu production server, enable MagicDNS, and activate Tailscale SSH for secure zero-trust admin access."
+---
+
+Tailscale forms the network security foundation for the MIS production server. Rather than exposing SQL Server or SSH to the public internet, you place the server inside a private tailnet where only authenticated, tagged devices can reach specific ports. This page walks you through installing Tailscale, verifying connectivity, enabling MagicDNS, and turning on Tailscale SSH.
+
+## Prerequisites
+
+- Ubuntu server with `sudo` access
+- A Tailscale account with admin rights to your tailnet
+- Outbound internet access from the server (Tailscale control plane uses HTTPS/443)
+
+---
+
+## Install and Activate Tailscale
+
+<Steps>
+
+  <Step title="Install Tailscale">
+    Run the official install script on the Ubuntu server. It detects your distro, adds the Tailscale repository, and installs the `tailscaled` daemon.
+
+    ```bash
+    curl -fsSL https://tailscale.com/install.sh | sh
+    ```
+  </Step>
+
+  <Step title="Bring the node up and authenticate">
+    Start Tailscale and authenticate the server to your tailnet. The command prints a URL — open it in a browser and approve the device under your Tailscale account.
+
+    ```bash
+    sudo tailscale up
+    ```
+
+    <Note>
+      Complete the browser authentication within a few minutes. The URL is single-use and expires if left open too long.
+    </Note>
+  </Step>
+
+  <Step title="Verify installation">
+    Confirm the daemon version, service health, and that the node has received a Tailscale IP.
+
+    ```bash
+    tailscale version
+    sudo systemctl status tailscaled --no-pager
+    tailscale status
+    tailscale ip -4
+    ```
+
+    You should see a `100.x.x.x` address assigned to the server. The `systemctl` output should show `active (running)`.
+  </Step>
+
+  <Step title="Run a network health check">
+    `netcheck` reports latency to DERP relay nodes and confirms whether direct UDP paths are available. Review the output to confirm there are no unexpected NAT issues.
+
+    ```bash
+    tailscale netcheck
+    ```
+  </Step>
+
+</Steps>
+
+---
+
+## Enable MagicDNS
+
+MagicDNS gives every node in your tailnet a stable hostname so you never need to hard-code Tailscale IPs in connection strings or scripts.
+
+<Steps>
+
+  <Step title="Enable MagicDNS in the admin console">
+    Open the [Tailscale Admin Console](https://login.tailscale.com/admin/dns) and navigate to **DNS**. Toggle **MagicDNS** on. Tailscale assigns your server a hostname of the form `mis-server.<tailnet>.ts.net`.
+  </Step>
+
+  <Step title="Confirm the machine name">
+    By default, Tailscale uses the OS hostname. If your server's hostname is not `mis-server`, rename it in the admin console under **Machines → (your server) → Edit machine name** so the MagicDNS hostname resolves as expected.
+  </Step>
+
+  <Step title="Test resolution from a client">
+    From any enrolled client machine, ping the server by its MagicDNS hostname:
+
+    ```bash
+    tailscale ping mis-server
+    ```
+
+    A successful reply confirms end-to-end reachability and that DNS is resolving correctly.
+
+    <Tip>
+      Always prefer the MagicDNS hostname `mis-server.<tailnet>.ts.net` over a hard-coded `100.x.x.x` IP in SQL connection strings and admin scripts. If you ever need to replace the server, the IP may change but the hostname stays the same.
+    </Tip>
+  </Step>
+
+</Steps>
+
+---
+
+## Enable Tailscale SSH
+
+Tailscale SSH replaces traditional key-based SSH for admin access over the Tailscale address. When it is active, the Tailscale daemon handles SSH connections and enforces the SSH policy you define in the ACL — no public key in `~/.ssh/authorized_keys` is required for this path.
+
+<Steps>
+
+  <Step title="Enable Tailscale SSH on the server">
+    ```bash
+    sudo tailscale set --ssh
+    ```
+  </Step>
+
+  <Step title="Confirm SSH is enabled">
+    Check `tailscale status` to verify the SSH flag is active. Look for `SSH` listed in the capabilities for this node.
+
+    ```bash
+    tailscale status
+    ```
+  </Step>
+
+  <Step title="Test admin login from your machine">
+    From your admin workstation (which must be in `autogroup:admin` per the ACL policy), SSH to the server using the MagicDNS hostname:
+
+    ```bash
+    ssh <linux-admin-user>@mis-server
+    # Or with the fully-qualified MagicDNS name:
+    ssh <linux-admin-user>@mis-server.<tailnet>.ts.net
+    ```
+
+    Replace `<linux-admin-user>` with the actual Linux account name on the Ubuntu server — this must match the `users` field in your `ssh` ACL block exactly.
+  </Step>
+
+</Steps>
+
+<Warning>
+  Keep the standard OpenSSH service (`sshd`) running during the deployment phase. Tailscale SSH should not be the sole admin path until you have verified a break-glass recovery option such as direct console access, IPMI/iDRAC/iLO, or a controlled local LAN path. The goal is not to open public SSH — it is to maintain a controlled rescue path in case Tailscale is unavailable.
+</Warning>
+
+---
+
+## Configure UFW for Tailscale-Only Access
+
+After Tailscale is running, restrict the host firewall so that SQL Server and SSH are only reachable through the `tailscale0` interface. This adds a second layer of defense on top of the Tailscale ACL policy.
+
+```bash
+# Allow SQL Server only from the Tailscale interface
+sudo ufw allow in on tailscale0 to any port 1433 proto tcp
+
+# Allow SSH only from the Tailscale interface
+sudo ufw allow in on tailscale0 to any port 22 proto tcp
+
+# Review the resulting rules
+sudo ufw status numbered
+sudo ufw status verbose
+```
+
+<Note>
+  These UFW rules do not replace the Tailscale ACL policy — they work alongside it. The ACL controls which tailnet nodes can reach which ports; UFW ensures that even if a packet somehow arrives outside the tailnet, the kernel drops it at the host.
+</Note>
+
+---
+
+## Verify the Full Setup
+
+Use this checklist to confirm all components are healthy before you move on to the ACL policy:
+
+<CardGroup cols={2}>
+  <Card title="Daemon running" icon="circle-check">
+    `sudo systemctl status tailscaled` shows `active (running)`
+  </Card>
+  <Card title="Node authenticated" icon="circle-check">
+    `tailscale status` shows the server with a `100.x.x.x` IP
+  </Card>
+  <Card title="MagicDNS resolving" icon="circle-check">
+    `tailscale ping mis-server` succeeds from a client
+  </Card>
+  <Card title="Tailscale SSH active" icon="circle-check">
+    Admin can `ssh <user>@mis-server` without a public key
+  </Card>
+</CardGroup>

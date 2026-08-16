@@ -1,0 +1,205 @@
+---
+title: "SSH Key Authentication & Hardening for the MIS Server"
+sidebarTitle: "SSH Hardening"
+description: "Set up ED25519 key-based SSH authentication and apply a drop-in hardening config that disables password login, root access, and X11 forwarding."
+---
+
+The default SSH configuration that ships with Ubuntu Server is functional but not hardened for production use. It permits password-based logins (vulnerable to brute-force attacks), allows root login attempts, and has generous authentication retry limits. This page walks you through generating a strong key pair, pushing the public key to the server, confirming that key login works, and then locking down the SSH daemon with a drop-in configuration file.
+
+The order of operations here is critical: **you must confirm that key-based login works in a new SSH session before you disable password authentication**. Reversing that order locks you out of the server.
+
+## Enable and Verify the SSH Service
+
+If you selected "OpenSSH Server" during the Ubuntu installer, SSH is already running. Confirm it:
+
+```bash
+sudo systemctl enable --now ssh
+sudo systemctl status ssh --no-pager
+sudo ss -lntp | grep ':22'
+```
+
+Expected output from `ss`:
+
+```
+LISTEN  0  128  0.0.0.0:22  0.0.0.0:*  users:(("sshd",pid=...,fd=...))
+LISTEN  0  128     [::]:22     [::]:*  users:(("sshd",pid=...,fd=...))
+```
+
+Port 22 must be listening before you attempt to push a key. If `systemctl status ssh` shows `inactive`, the `enable --now` command above has already started it.
+
+## Generate an ED25519 Key Pair
+
+Run this command **on your admin machine** (your laptop or workstation) — not on the server. This generates a private key (which stays on your machine) and a public key (which you will upload to the server).
+
+```bash
+ssh-keygen -t ed25519 -a 100 -C "mis-server-admin"
+```
+
+| Flag | Meaning |
+|---|---|
+| `-t ed25519` | Use the ED25519 algorithm — modern, fast, and shorter than RSA-4096 |
+| `-a 100` | 100 key derivation rounds for the passphrase KDF — makes offline brute-force harder |
+| `-C "mis-server-admin"` | A comment to identify this key in `authorized_keys` files |
+
+The command prompts you for a file path (accept the default, or specify `~/.ssh/mis-server`) and a passphrase. **Use a strong passphrase.** This passphrase protects the private key file on your workstation.
+
+<Warning>
+Never generate the key pair on the server and then transfer the private key to your workstation. The private key must be generated on the machine that will use it and must never leave that machine.
+</Warning>
+
+## Copy the Public Key to the Server
+
+From your admin machine, push the public key to the server using `ssh-copy-id`:
+
+```bash
+ssh-copy-id <admin-user>@<server-lan-ip>
+```
+
+Replace `<admin-user>` with your admin username (for example `hainguyen`) and `<server-lan-ip>` with the server's static LAN IP (for example `192.168.1.74`).
+
+`ssh-copy-id` will:
+1. Prompt you for the admin user's **password** (the one set during installation)
+2. Append your public key to `~/.ssh/authorized_keys` on the server
+3. Set the correct file permissions on `~/.ssh/` and `authorized_keys`
+
+<Note>
+If you used a non-default key file path during generation, specify it explicitly:
+
+```bash
+ssh-copy-id -i ~/.ssh/mis-server.pub <admin-user>@<server-lan-ip>
+```
+</Note>
+
+## Confirm Key Login in a New SSH Session
+
+**This step is mandatory.** Open a brand-new terminal and connect to the server. Do not reuse an existing session.
+
+```bash
+ssh <admin-user>@<server-lan-ip>
+```
+
+The connection should succeed using your key (you will be prompted for your key's passphrase, not the server user's password). Confirm you reach the shell prompt.
+
+<Warning>
+Do **not** close your existing SSH session until you have confirmed the key login works. If something went wrong with the key copy, your existing password-based session is your only way back in. You will need it to diagnose and fix the issue before hardening.
+</Warning>
+
+## Apply SSH Hardening
+
+Ubuntu's SSH daemon supports drop-in configuration files in `/etc/ssh/sshd_config.d/`. Using a drop-in file (rather than editing the main `sshd_config`) means system updates cannot silently overwrite your changes.
+
+<Steps>
+  <Step title="Create the Hardening Drop-In File">
+    From your confirmed key-based SSH session on the server, create the hardening file:
+
+    ```bash
+    sudoedit /etc/ssh/sshd_config.d/99-mis-hardening.conf
+    ```
+  </Step>
+
+  <Step title="Add the Hardening Directives">
+    Enter the following content exactly:
+
+    ```
+    PermitRootLogin no
+    PasswordAuthentication no
+    PubkeyAuthentication yes
+    KbdInteractiveAuthentication no
+    X11Forwarding no
+    MaxAuthTries 3
+    ```
+
+    | Directive | Value | Reason |
+    |---|---|---|
+    | `PermitRootLogin` | `no` | Eliminates direct root brute-force attacks |
+    | `PasswordAuthentication` | `no` | Disables password login — key only |
+    | `PubkeyAuthentication` | `yes` | Explicitly confirms key auth is enabled |
+    | `KbdInteractiveAuthentication` | `no` | Disables PAM challenge-response (also allows passwords) |
+    | `X11Forwarding` | `no` | No GUI; prevents X11-based attack surface |
+    | `MaxAuthTries` | `3` | Locks out after 3 failed attempts per connection |
+
+    Save and close the file.
+  </Step>
+
+  <Step title="Validate the Configuration and Reload">
+    Before reloading the daemon, validate that the combined configuration (main file + drop-in) has no syntax errors:
+
+    ```bash
+    sudo sshd -t && sudo systemctl reload ssh
+    ```
+
+    `sshd -t` performs a dry-run configuration test. If it exits silently, the config is valid. The `&&` operator ensures `systemctl reload ssh` only runs if the test passes.
+
+    <Warning>
+    Never run `systemctl restart ssh` without first running `sshd -t`. A restart with a broken config will drop your session and refuse new connections. `reload` is safer — it only applies the new config to new connections while keeping existing sessions alive.
+    </Warning>
+  </Step>
+
+  <Step title="Verify Hardening is Active">
+    From a **third terminal** (not your existing sessions), attempt to connect:
+
+    ```bash
+    ssh <admin-user>@<server-lan-ip>
+    ```
+
+    You should be prompted for your key passphrase — not a password. The connection should succeed.
+
+    Then attempt a root login to confirm it is blocked:
+
+    ```bash
+    ssh root@<server-lan-ip>
+    ```
+
+    This must fail with `Permission denied (publickey)` or `Permission denied`.
+  </Step>
+</Steps>
+
+## Optional: Configure SSH Client Shortcut
+
+On your admin workstation, add a host entry to `~/.ssh/config` to avoid typing the full address each time:
+
+```
+Host mis-server
+    HostName 192.168.1.74
+    User hainguyen
+    IdentityFile ~/.ssh/mis-server
+    ServerAliveInterval 60
+    ServerAliveCountMax 3
+```
+
+After adding this, you can connect with:
+
+```bash
+ssh mis-server
+```
+
+<Note>
+Once Tailscale is installed on the server, add a second entry using the Tailscale IP (for example `100.x.y.z`) so you can connect remotely when you are off the LAN.
+</Note>
+
+## What Happens If You Get Locked Out
+
+If you lose SSH access after hardening:
+
+1. Connect to the server via **physical console** (keyboard and monitor directly attached, or IPMI/iDRAC/iLO).
+2. Log in with the admin user's password.
+3. Check the SSH service: `sudo systemctl status ssh` and `journalctl -u ssh -b --no-pager`.
+4. Inspect the hardening file: `sudo cat /etc/ssh/sshd_config.d/99-mis-hardening.conf`.
+5. Run `sudo sshd -t` to identify configuration errors.
+6. Fix the file, re-run `sudo sshd -t`, then `sudo systemctl reload ssh`.
+
+<Tip>
+Testing the lockout recovery path during initial setup — while you still have console access easily available — is much better than discovering you cannot perform it during an incident.
+</Tip>
+
+## Checklist Before Moving On
+
+- [ ] `sudo systemctl status ssh` shows active and running
+- [ ] `ssh-keygen -t ed25519 -a 100` generated a key pair on the admin workstation
+- [ ] `ssh-copy-id` successfully uploaded the public key
+- [ ] Key-based login confirmed in a new terminal session
+- [ ] `/etc/ssh/sshd_config.d/99-mis-hardening.conf` created with all six directives
+- [ ] `sudo sshd -t` passed with no errors
+- [ ] `sudo systemctl reload ssh` applied the changes
+- [ ] Root login attempt was correctly rejected
+- [ ] Password-based login correctly rejected (test from a machine without the key)

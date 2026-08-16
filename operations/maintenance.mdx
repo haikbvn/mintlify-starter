@@ -1,0 +1,218 @@
+---
+title: "Periodic Maintenance Schedule for MIS Server"
+sidebarTitle: "Maintenance"
+description: "Follow a tested cadence — daily checks through quarterly restore drills — to keep your MIS server stable, backups verified, and RPO targets met."
+---
+
+Maintenance is not a single event — it is a repeating rhythm that keeps small problems from becoming outages. This page defines what you check daily, weekly, monthly, and quarterly, plus the exact steps to follow before and after any change that requires a reboot. Skipping the pre-maintenance checklist is the most common cause of avoidable downtime.
+
+## Maintenance Schedule
+
+| Frequency | Action |
+|---|---|
+| **Daily** | Confirm most recent backup completed; check available disk space |
+| **Weekly** | Verify SQL Server, Tailscale, and all services are healthy; confirm NAS backup transferred |
+| **Monthly** | Run `RESTORE VERIFYONLY` on a backup file; review SMART data; audit failed systemd units; review system logs |
+| **Quarterly** | Full restore drill from NAS to a test environment; run `DBCC CHECKDB`; review and document RPO/RTO |
+| **Before any update** | Take a fresh backup, confirm it verified, communicate downtime, apply update in maintenance window, reboot, test MIS |
+
+<Tip>
+  Automate daily and weekly checks with a simple shell script that writes pass/fail output to a log file, then tail that log during your morning routine. The script does not need to be sophisticated — just reliable.
+</Tip>
+
+## Pre-Maintenance Checklist
+
+Complete every item on this checklist before applying updates, changing configuration, or rebooting the server. Skipping any item means you are making a change without a safety net.
+
+<AccordionGroup>
+  <Accordion title="Recent backup exists">
+    Confirm that a backup `.bak` file from the last 24 hours is present on local storage and on the NAS. Check the file modification time:
+
+    ```bash
+    ls -lh /var/opt/mssql/backups/
+    ```
+
+    Do not proceed if the most recent backup is older than your RPO window.
+  </Accordion>
+
+  <Accordion title="Backup VERIFY passed">
+    Run `RESTORE VERIFYONLY` against the most recent backup file before you make any change. A backup that has never been verified may not be restorable.
+
+    ```bash
+    sqlcmd -S localhost -U sa -Q "RESTORE VERIFYONLY FROM DISK = N'/var/opt/mssql/backups/mis_latest.bak';"
+    ```
+
+    Only proceed if the output reads `The backup set on file 1 is valid.`
+  </Accordion>
+
+  <Accordion title="NAS backup confirmed">
+    Log in to the NAS or check the backup transfer log to confirm the most recent file copied successfully. A local backup alone is not sufficient — if the server itself fails during maintenance, you need the NAS copy.
+  </Accordion>
+
+  <Accordion title="Rollback and recovery plan documented">
+    Know exactly how you will roll back if the update fails. For OS package updates, identify the package version you are replacing. For SQL Server updates, note the current version with:
+
+    ```bash
+    sqlcmd -S localhost -U sa -Q "SELECT @@VERSION;"
+    ```
+
+    Write down your recovery steps before you start, not after something breaks.
+  </Accordion>
+
+  <Accordion title="Downtime communicated">
+    Notify all MIS users of the maintenance window. Confirm no active sessions are open against the database when you begin:
+
+    ```bash
+    sqlcmd -S localhost -U sa -Q "SELECT session_id, login_name, status, host_name FROM sys.dm_exec_sessions WHERE database_id = DB_ID('YourDatabaseName');"
+    ```
+
+    Replace `YourDatabaseName` with your actual MIS database name.
+  </Accordion>
+</AccordionGroup>
+
+## Applying Updates
+
+<Steps>
+  <Step title="Complete the pre-maintenance checklist">
+    Do not skip this. Confirm backup, verify, NAS copy, and communicated downtime before touching anything.
+  </Step>
+
+  <Step title="Apply OS and package updates">
+    ```bash
+    sudo apt update
+    sudo apt upgrade -y
+    ```
+
+    Review the list of packages being upgraded before confirming. Pay particular attention to kernel updates, as they require a reboot.
+  </Step>
+
+  <Step title="Reboot the server">
+    ```bash
+    sudo reboot
+    ```
+
+    Wait for the server to come back online (typically 60–120 seconds). Watch for it to reappear in your Tailscale dashboard or ping its LAN IP.
+  </Step>
+
+  <Step title="Run post-reboot verification">
+    Once the server is back, confirm all critical services started automatically (see [Post-Reboot Verification](#post-reboot-verification) below).
+  </Step>
+
+  <Step title="Test MIS from a client">
+    Log in to MIS from a client workstation and perform a representative operation (login, record lookup, typical workflow). Confirm the application behaves normally before declaring the maintenance window closed.
+  </Step>
+</Steps>
+
+## Service Auto-Start Verification
+
+Before rebooting, confirm that all critical services are configured to start automatically. A service that is running but not enabled will not restart after a reboot.
+
+```bash
+# Confirm SQL Server is set to start at boot
+systemctl is-enabled mssql-server
+
+# Confirm Tailscale is set to start at boot
+systemctl is-enabled tailscaled
+```
+
+Both commands should return `enabled`. If either returns `disabled` or `static`, enable it before rebooting:
+
+```bash
+sudo systemctl enable mssql-server
+sudo systemctl enable tailscaled
+```
+
+## Post-Reboot Verification
+
+Run these checks immediately after the server comes back online. Work through them in order — each layer depends on the one before it.
+
+```bash
+# SQL Server running
+systemctl is-active mssql-server
+
+# Tailscale running
+systemctl is-active tailscaled
+
+# Network interfaces and assigned IPs
+ip -br addr
+
+# Tailscale peers online
+tailscale status
+
+# UFW firewall active
+sudo ufw status
+
+# SQL Server listening on TCP 1433
+sudo ss -lntp | grep 1433
+
+# Any failed systemd units
+systemctl --failed
+```
+
+<Note>
+  If `ss -lntp | grep 1433` returns no output, SQL Server is not listening on TCP. This usually means the service failed to start cleanly. Check `journalctl -u mssql-server -b --no-pager | tail -50` for the reason.
+</Note>
+
+## Post-Reboot Client Checklist
+
+After confirming the server side, verify end-to-end connectivity from a client workstation:
+
+<CardGroup cols={2}>
+  <Card title="Tailscale Online" icon="wifi">
+    The MIS server appears as `online` in `tailscale status` on the client.
+  </Card>
+  <Card title="MagicDNS Resolves" icon="magnifying-glass">
+    `mis-server` (or your Tailscale hostname) resolves to the server's Tailscale IP.
+  </Card>
+  <Card title="TCP 1433 Passes" icon="plug">
+    `Test-NetConnection mis-server -Port 1433` returns `TcpTestSucceeded : True`.
+  </Card>
+  <Card title="MIS Login Passes" icon="key">
+    You can log in to the MIS application successfully with a production account.
+  </Card>
+  <Card title="Record Lookup Passes" icon="table">
+    A representative data lookup returns the expected results — confirming the database itself is healthy.
+  </Card>
+</CardGroup>
+
+## Quarterly Restore Drill
+
+A backup you have never tested is an assumption, not a guarantee. Perform a restore drill every quarter.
+
+<Steps>
+  <Step title="Copy the NAS backup to a test location">
+    Transfer the most recent backup file from the NAS to a test server or a local staging directory — do not restore over the production database.
+  </Step>
+
+  <Step title="Restore to a test database">
+    ```bash
+    sqlcmd -S localhost -U sa -Q "
+    RESTORE DATABASE MIS_Test
+    FROM DISK = N'/tmp/mis_test_restore.bak'
+    WITH MOVE 'MIS_Data' TO '/var/opt/mssql/data/MIS_Test.mdf',
+         MOVE 'MIS_Log'  TO '/var/opt/mssql/data/MIS_Test_log.ldf',
+         REPLACE, STATS = 10;
+    "
+    ```
+
+    Replace database name and logical file names with your actual values.
+  </Step>
+
+  <Step title="Run DBCC CHECKDB">
+    ```bash
+    sqlcmd -S localhost -U sa -Q "DBCC CHECKDB ('MIS_Test') WITH NO_INFOMSGS, ALL_ERRORMSGS;"
+    ```
+
+    A clean output with zero errors confirms database integrity.
+  </Step>
+
+  <Step title="Record results and update RPO/RTO assessment">
+    Document the total time from initiating the restore to a verified, queryable database. Compare this to your Recovery Time Objective. If the actual restore time exceeds your RTO, adjust your backup strategy, hardware, or target accordingly.
+  </Step>
+
+  <Step title="Drop the test database">
+    ```bash
+    sqlcmd -S localhost -U sa -Q "DROP DATABASE MIS_Test;"
+    ```
+  </Step>
+</Steps>

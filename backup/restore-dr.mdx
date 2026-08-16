@@ -1,0 +1,260 @@
+---
+title: "Restore Testing and Disaster Recovery Procedures"
+sidebarTitle: "Restore & DR"
+description: "Run verified restore drills, execute post-restore integrity checks, and follow a step-by-step complete server failure recovery guide with RPO/RTO targets."
+---
+
+A backup you have never restored is an untested assumption. This page covers how to restore a backup to a test database, run integrity checks, and what to do when the production server fails completely. Keep this page bookmarked — when you need it, you will need it quickly.
+
+<Warning>
+**Never restore directly on top of the production database.** Always restore to a separate test database first. Restoring over a live database destroys the existing data immediately and cannot be undone.
+</Warning>
+
+## Recovery Targets
+
+Your MIS Production Server operates under the following recovery objectives:
+
+| Target | Value |
+|---|---|
+| Recovery Point Objective (RPO) | ≤ 24 hours |
+| Recovery Time Objective (RTO) | ≤ 4 hours |
+
+<Note>
+  These are targets, not guarantees. You must verify them through a real restore drill. Record actual recovery time and data loss in every drill so you can track whether you are meeting the targets and identify where time is lost.
+</Note>
+
+## Restore a Backup to a Test Database
+
+Run this procedure regularly — at minimum after every change to the backup script, after any SQL Server upgrade, and on a scheduled quarterly drill.
+
+<Steps>
+  <Step title="Identify the logical file names inside the backup">
+    Before you can restore, you need to know the logical names SQL Server uses for the data and log files inside the `.bak`:
+
+    ```sql
+    RESTORE FILELISTONLY
+    FROM DISK = N'/var/opt/mssql/backup/local/<FILE>.bak';
+    GO
+    ```
+
+    Note the `LogicalName` values for the rows where `Type` is `D` (data) and `L` (log). You will use them in the next step.
+  </Step>
+
+  <Step title="Restore to MIS_RESTORE_TEST">
+    Replace `<LOGICAL_DATA_NAME>` and `<LOGICAL_LOG_NAME>` with the values from the previous step:
+
+    ```sql
+    RESTORE DATABASE [MIS_RESTORE_TEST]
+    FROM DISK = N'/var/opt/mssql/backup/local/<FILE>.bak'
+    WITH
+      MOVE N'<LOGICAL_DATA_NAME>'
+        TO N'/var/opt/mssql/data/MIS_RESTORE_TEST.mdf',
+      MOVE N'<LOGICAL_LOG_NAME>'
+        TO N'/var/opt/mssql/data/MIS_RESTORE_TEST_log.ldf',
+      RECOVERY,
+      STATS = 10;
+    GO
+    ```
+
+    The `MOVE` clauses redirect the restored files to new paths so they do not conflict with the production database files. `STATS = 10` prints progress every 10 percent.
+  </Step>
+
+  <Step title="Check the database came online">
+    ```sql
+    SELECT name, state_desc
+    FROM sys.databases
+    WHERE name = 'MIS_RESTORE_TEST';
+    GO
+    ```
+
+    `state_desc` must read `ONLINE`. Any other value — `RESTORING`, `SUSPECT`, `RECOVERY_PENDING` — indicates a problem.
+  </Step>
+
+  <Step title="Run DBCC CHECKDB on the restored database">
+    ```sql
+    DBCC CHECKDB ([MIS_RESTORE_TEST]) WITH NO_INFOMSGS;
+    GO
+    ```
+
+    A clean result prints no rows. Any output indicates allocation or consistency errors in the restored data. If errors appear here, investigate before trusting this backup for a real recovery.
+  </Step>
+
+  <Step title="Verify table count">
+    Confirm that the restore contains the expected number of tables:
+
+    ```sql
+    SELECT COUNT(*) AS TableCount
+    FROM [MIS_RESTORE_TEST].sys.tables;
+    GO
+    ```
+
+    Compare this against the table count from production. A significant difference may indicate a wrong backup file or a partial restore.
+  </Step>
+
+  <Step title="Drop the test database when done">
+    ```sql
+    DROP DATABASE [MIS_RESTORE_TEST];
+    GO
+    ```
+
+    Leaving test databases on the production instance wastes disk space and can confuse future restore drills.
+  </Step>
+</Steps>
+
+## Run DBCC CHECKDB on Production
+
+Run a consistency check on your live production database on a regular schedule — weekly is a reasonable baseline:
+
+```sql
+DBCC CHECKDB (N'<MIS_DATABASE>') WITH NO_INFOMSGS;
+GO
+```
+
+<Tip>
+  Schedule `DBCC CHECKDB` to run during a low-traffic window. On small databases it completes in seconds; on larger databases it may take minutes and increases I/O load.
+</Tip>
+
+Check the state of all databases at any time with:
+
+```sql
+SELECT name, state_desc, recovery_model_desc
+FROM sys.databases
+ORDER BY name;
+GO
+```
+
+## Complete Server Failure Recovery
+
+Use this procedure when the production server is unrecoverable — hardware failure, OS corruption, ransomware, or physical loss.
+
+<Warning>
+  As your first action, **preserve all NAS and backup copies**. Do not delete, overwrite, or modify any existing backup files during the recovery process.
+</Warning>
+
+<Steps>
+  <Step title="Secure your backups">
+    Confirm that the NAS is reachable and that the most recent `.bak` file is intact. Do not start provisioning new infrastructure until you know which backup you will restore from.
+  </Step>
+
+  <Step title="Provision a new server">
+    Obtain replacement hardware or a virtual machine with equivalent or greater CPU, RAM, and disk resources to the failed server.
+  </Step>
+
+  <Step title="Install Ubuntu Server 24.04 LTS">
+    Perform a clean install. Apply all available security updates before proceeding:
+
+    ```bash
+    sudo apt update && sudo apt upgrade -y
+    ```
+  </Step>
+
+  <Step title="Install SQL Server 2025 Express">
+    Follow the Microsoft installation guide for SQL Server on Ubuntu. After installation, verify the service is running:
+
+    ```bash
+    sudo systemctl status mssql-server
+    ```
+  </Step>
+
+  <Step title="Configure network, UFW, and Tailscale">
+    Assign the same hostname and IP address as the failed server (or update DNS records). Restore your UFW rules and reconnect the machine to the Tailscale network so that MIS clients can reach it.
+  </Step>
+
+  <Step title="Mount the NAS">
+    Follow the [NAS Backup](/backup/nas-backup) page to recreate the `/etc/fstab` entry and verify that the `mssql` service account can write to the share.
+  </Step>
+
+  <Step title="Copy the backup file locally and verify it">
+    Copy the most recent backup from the NAS to the local backup directory:
+
+    ```bash
+    sudo -u mssql rsync -avh --partial --checksum \
+      /mnt/mis-nas/mis-server/<FILE>.bak \
+      /var/opt/mssql/backup/local/
+    ```
+
+    Then verify the backup header and checksums before attempting a restore:
+
+    ```sql
+    RESTORE VERIFYONLY
+    FROM DISK = N'/var/opt/mssql/backup/local/<FILE>.bak'
+    WITH CHECKSUM;
+    GO
+    ```
+  </Step>
+
+  <Step title="Restore the production database">
+    Get the logical file names first:
+
+    ```sql
+    RESTORE FILELISTONLY
+    FROM DISK = N'/var/opt/mssql/backup/local/<FILE>.bak';
+    GO
+    ```
+
+    Then restore directly to the production database name:
+
+    ```sql
+    RESTORE DATABASE [<MIS_DATABASE>]
+    FROM DISK = N'/var/opt/mssql/backup/local/<FILE>.bak'
+    WITH
+      MOVE N'<LOGICAL_DATA_NAME>'
+        TO N'/var/opt/mssql/data/<MIS_DATABASE>.mdf',
+      MOVE N'<LOGICAL_LOG_NAME>'
+        TO N'/var/opt/mssql/data/<MIS_DATABASE>_log.ldf',
+      RECOVERY,
+      STATS = 10;
+    GO
+    ```
+  </Step>
+
+  <Step title="Run DBCC CHECKDB">
+    ```sql
+    DBCC CHECKDB (N'<MIS_DATABASE>') WITH NO_INFOMSGS;
+    GO
+    ```
+
+    Confirm the database is `ONLINE` and the consistency check returns no errors before allowing client connections.
+  </Step>
+
+  <Step title="Install and configure MIS client and server components">
+    Reinstall any MIS application services, connection strings, and scheduled tasks that were running on the failed server. Refer to the MIS installation documentation for your version.
+  </Step>
+
+  <Step title="Test from clients">
+    Ask a representative user at each client site to log in and confirm that data reads and writes are working correctly. Test any integrations or scheduled reports that run against the database.
+  </Step>
+
+  <Step title="Record actual RPO and RTO">
+    Note the timestamp of the most recent backup you restored from (this determines actual data loss) and the total elapsed time from the moment of failure declaration to the moment clients confirmed the system was working (this is your actual RTO). Compare both figures against the targets in the table at the top of this page.
+  </Step>
+</Steps>
+
+## RPO/RTO Drill Checklist
+
+Run through this checklist at the end of every restore drill to confirm you met all recovery criteria:
+
+<CardGroup cols={2}>
+  <Card title="Backup Located" icon="magnifying-glass">
+    You know where the most recent backup is — both locally and on the NAS — and you can access it.
+  </Card>
+  <Card title="Restored from NAS" icon="server">
+    You successfully restored the database from a NAS copy, not just a local copy.
+  </Card>
+  <Card title="Database ONLINE" icon="circle-check">
+    `state_desc = ONLINE` in `sys.databases` after the restore completes.
+  </Card>
+  <Card title="DBCC CHECKDB Passes" icon="shield-check">
+    `DBCC CHECKDB` returns no errors or warnings against the restored database.
+  </Card>
+  <Card title="MIS Client Works" icon="desktop">
+    At least one MIS client successfully authenticates and reads and writes data.
+  </Card>
+  <Card title="RTO Met" icon="clock">
+    Total elapsed recovery time is within the 4-hour target. If not, document the bottleneck.
+  </Card>
+</CardGroup>
+
+<Tip>
+  Store a printed copy of the complete server failure recovery steps (above) in a location you can reach without network access — if the server is down, your documentation server may be too.
+</Tip>

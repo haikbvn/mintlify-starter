@@ -1,0 +1,166 @@
+---
+title: "Server Health Monitoring for MIS Production"
+sidebarTitle: "Monitoring"
+description: "Run daily health checks, track disk usage, monitor SMART drive data, and set actionable thresholds to keep your MIS server stable around the clock."
+---
+
+Consistent monitoring is what separates a reliable production server from one that surprises you with an outage. Because your deployment serves a small number of clients, you don't need an enterprise observability stack — a lightweight agent like Netdata combined with disciplined manual checks covers everything. This page walks you through the health checks you should run, the thresholds that matter, and how to keep storage from silently filling up.
+
+## Monitoring Thresholds
+
+React to these thresholds before they escalate into incidents.
+
+| Metric | Warning | Critical / Action Required |
+|---|---|---|
+| Disk usage | 70% | 85% — act immediately; never let it reach 100% |
+| Backup age | — | > 26 h since last successful nightly backup |
+| SQL Server service | — | `inactive` state = critical |
+| Tailscale | degraded | `offline` on any client = warning/critical |
+| SMART | — | Any critical warning or media error |
+| Failed systemd units | — | Any `> 0` result needs investigation |
+
+<Warning>
+  **Never let the production filesystem reach 100% utilization.** SQL Server will stop writing to database files and transaction logs when the disk is full, which can corrupt in-flight transactions and require a restore. Alert at 70%, take corrective action before 85%, and treat a full filesystem as a P1 incident.
+</Warning>
+
+## Basic Health Check
+
+Run these commands whenever you log in for a quick server pulse.
+
+```bash
+# System uptime and load average
+uptime
+
+# Memory usage summary
+free -h
+
+# Filesystem utilization across all mounts
+df -h
+
+# Any systemd units in a failed state
+systemctl --failed
+
+# SQL Server service status
+sudo systemctl status mssql-server --no-pager
+
+# Tailscale daemon status
+sudo systemctl status tailscaled --no-pager
+
+# UFW firewall rules summary
+sudo ufw status verbose
+```
+
+<Tip>
+  Pipe `systemctl --failed` output into your log rotation or alerting script. A non-empty result means something needs attention — even if MIS appears to be working at that moment.
+</Tip>
+
+## SQL Server Health
+
+Check that SQL Server is active and review recent log output for errors.
+
+```bash
+# Confirm the service is in an active (running) state
+systemctl is-active mssql-server
+
+# Tail the last 100 log lines from the current boot
+journalctl -u mssql-server -b --no-pager | tail -n 100
+```
+
+If `systemctl is-active` returns anything other than `active`, escalate immediately — this is a critical event. Use the `journalctl` output to identify the error before attempting a restart.
+
+## Tailscale Connectivity
+
+```bash
+# Show all peers and their online/offline state
+tailscale status
+```
+
+Confirm that your admin device and all MIS client machines appear as `online`. A peer showing as `offline` means that client cannot reach SQL Server over the tailnet until the issue is resolved.
+
+## Disk Usage Monitoring
+
+<Steps>
+  <Step title="Check top-level disk utilization">
+    Start with the high-level view across all filesystems:
+
+    ```bash
+    df -h
+    ```
+
+    Focus on the filesystem that contains `/var` — this is where SQL Server stores database files and logs.
+  </Step>
+
+  <Step title="Drill into /var usage">
+    If `/var` is above 70%, identify which subdirectory is consuming space:
+
+    ```bash
+    sudo du -xhd1 /var | sort -h
+    ```
+  </Step>
+
+  <Step title="Drill into SQL Server data directory">
+    If `/var/opt/mssql` is the culprit, break it down further:
+
+    ```bash
+    sudo du -xhd1 /var/opt/mssql | sort -h
+    ```
+
+    Common causes include uncleaned `.bak` backup files, runaway transaction log growth, or forgotten diagnostic trace files.
+  </Step>
+</Steps>
+
+<Note>
+  Transaction log files (`.ldf`) can grow unbounded if the database recovery model is set to `FULL` and log backups are not running. If you see unexpectedly large log files, verify your backup schedule and consider switching non-critical databases to the `SIMPLE` recovery model.
+</Note>
+
+## SMART Drive Health
+
+Check your storage device health at least monthly, and any time the server behaves unexpectedly.
+
+<CodeGroup>
+
+```bash NVMe Drive
+sudo nvme smart-log /dev/nvme0
+```
+
+```bash SATA Drive
+sudo smartctl -a /dev/sda
+```
+
+</CodeGroup>
+
+**What to look for:**
+
+- **NVMe:** `critical_warning` should be `0`; `media_errors` should be `0`. Monitor `percentage_used` (alert when it approaches 90%) and `temperature` (alert above manufacturer spec, typically ~70 °C).
+- **SATA:** `SMART overall-health self-assessment` should read `PASSED`. Zero reallocated sectors, zero pending sectors, and zero uncorrectable errors are the baselines to watch.
+
+<Warning>
+  Any non-zero `media_errors` or `critical_warning` value on an NVMe drive, or any SMART attribute with a `FAILING_NOW` flag on a SATA drive, means the drive is failing. Stop scheduling writes to that device and plan an immediate replacement with data migration. Do not wait.
+</Warning>
+
+## Lightweight Monitoring Agent
+
+For a deployment serving around three clients, a full monitoring stack (Prometheus, Grafana, Alertmanager) adds operational complexity without proportional benefit. A single Netdata instance on the server covers CPU, memory, disk I/O, network, and process-level metrics with minimal configuration and a built-in web dashboard.
+
+<Note>
+  Make sure your monitoring agent itself is not a single point of failure. If Netdata crashes or its service fails, your server continues to serve MIS traffic normally — the agent is read-only and sits outside the data path. Add `netdata` to your `systemctl --failed` sweep so you notice if it stops collecting.
+</Note>
+
+Install Netdata with the official one-liner and then confirm it is running:
+
+```bash
+# Install Netdata (requires internet access at install time)
+bash <(curl -Ss https://my-netdata.io/kickstart.sh) --stable-channel --disable-telemetry
+
+# Verify the service started
+systemctl is-active netdata
+```
+
+Access the dashboard at `http://<server-lan-ip>:19999` from your admin workstation. Restrict access using UFW so the dashboard is not exposed beyond the LAN:
+
+```bash
+# Allow Netdata dashboard only from your LAN subnet
+sudo ufw allow from 192.168.1.0/24 to any port 19999 proto tcp
+```
+
+Replace `192.168.1.0/24` with your actual LAN subnet.

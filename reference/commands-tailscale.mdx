@@ -1,0 +1,130 @@
+---
+title: "Tailscale Setup & Connectivity Command Reference"
+sidebarTitle: "Tailscale Commands"
+description: "Commands and ACL policy JSON to install Tailscale, enable Tailscale SSH, verify node connectivity, and test MIS server access from Windows clients."
+---
+
+This page collects every command and configuration snippet you need to set up Tailscale on the MIS server, verify connectivity from admin workstations, and confirm that Windows MIS clients can reach SQL Server over the tailnet. The ACL policy JSON is the single source of truth for what traffic is permitted — keep it under version control alongside this runbook.
+
+## Install Tailscale on the Server
+
+The official install script detects your distro and adds the correct package repository automatically.
+
+```bash
+curl -fsSL https://tailscale.com/install.sh | sh
+```
+
+## Join the Tailnet
+
+```bash
+sudo tailscale up
+```
+
+This command opens an authentication URL. Open it in a browser, log in to your Tailscale account, and authorise the device. The server will appear in your admin console at [login.tailscale.com](https://login.tailscale.com).
+
+## Enable Tailscale SSH
+
+Tailscale SSH lets admins SSH into the server using their Tailscale identity, without managing additional authorised keys on the server itself.
+
+```bash
+sudo tailscale set --ssh
+```
+
+<Note>
+  Tailscale SSH requires a matching `ssh` block in your ACL policy (see below). Enabling it on the node alone is not sufficient.
+</Note>
+
+## Verify Node Status
+
+```bash
+# Show all peers, their IPs, and online/offline state
+tailscale status
+
+# Run latency and path tests to nearby DERP relays
+tailscale netcheck
+```
+
+## Ping the MIS Server from Another Node
+
+```bash
+# Replace <mis-server-magicdns-name> with the server's MagicDNS hostname
+# e.g. mis-server.your-tailnet-name.ts.net
+tailscale ping <mis-server-magicdns-name>
+```
+
+A successful ping shows direct or relayed latency and confirms the node is reachable within the tailnet.
+
+## SSH to the Server via Tailscale
+
+```bash
+# Replace <linux-admin-user> with your Linux admin username on the server
+# Replace <mis-server-magicdns-name> with the server's MagicDNS hostname
+ssh <linux-admin-user>@<mis-server-magicdns-name>
+```
+
+---
+
+## ACL Policy
+
+Apply this policy in your Tailscale admin console under **Access controls**. It restricts SQL Server access to tagged MIS client machines and SSH access to admin identities only.
+
+```json
+{
+  "tagOwners": {
+    "tag:mis-server": ["autogroup:admin"],
+    "tag:mis-client": ["autogroup:admin"]
+  },
+  "grants": [
+    {
+      "src": ["tag:mis-client"],
+      "dst": ["tag:mis-server"],
+      "ip":  ["tcp:1433"]
+    },
+    {
+      "src": ["autogroup:admin"],
+      "dst": ["tag:mis-server"],
+      "ip":  ["tcp:22"]
+    }
+  ],
+  "ssh": [
+    {
+      "action": "check",
+      "src":    ["autogroup:admin"],
+      "dst":    ["tag:mis-server"],
+      "users":  ["<linux-admin-user>"]  // Replace with the Linux username on the server
+    }
+  ],
+  "tests": [
+    {
+      "src":    "tag:mis-client",
+      "accept": ["tag:mis-server:1433"],
+      "deny":   ["tag:mis-server:22"]
+    }
+  ]
+}
+```
+
+<Warning>
+  Assign the `tag:mis-server` tag to the MIS server node and the `tag:mis-client` tag to each Windows MIS client in the Tailscale admin console. Nodes without the correct tags will not match these grants and will be denied.
+</Warning>
+
+---
+
+## Windows Client Connectivity Tests
+
+Run these commands in PowerShell on each Windows MIS client after installing Tailscale and assigning the `tag:mis-client` tag.
+
+```powershell
+# Confirm Tailscale can reach the server (replace with the real MagicDNS hostname)
+tailscale ping <mis-server-magicdns-name>
+
+# Test SQL Server port — result should show TcpTestSucceeded : True
+Test-NetConnection <mis-server-magicdns-name> -Port 1433
+
+# Test SSH port — should succeed for admin machines, fail for mis-client tagged nodes
+Test-NetConnection <mis-server-magicdns-name> -Port 22
+```
+
+<Tip>
+  If `Test-NetConnection` to port 1433 fails but `tailscale ping` succeeds, check that the Windows client node has the `tag:mis-client` tag applied in the Tailscale admin console and that the ACL policy has been saved.
+</Tip>

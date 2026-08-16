@@ -1,0 +1,240 @@
+---
+title: "NAS Mount, Monitoring & UPS Command Reference"
+sidebarTitle: "NAS & Monitoring"
+description: "Commands to mount the NAS share over CIFS, verify mssql write access, monitor server health, check SMART disk data, and configure NUT for UPS shutdown."
+---
+
+This page brings together the commands for mounting the NAS backup share, checking that the `mssql` service account can write to it, monitoring overall server health, reading drive SMART data, and setting up NUT for graceful UPS-triggered shutdown. Treat the NAS mount and monitoring sections as day-one operational tasks; return to the monitoring section during any incident or weekly health check.
+
+## NAS Mount (CIFS/SMB)
+
+### Create the Mount Point
+
+```bash
+sudo mkdir -p /mnt/mis-nas
+```
+
+### Store NAS Credentials
+
+Create a root-only credentials file so the password never appears in `/etc/fstab` in plain text.
+
+```bash
+sudoedit /root/.smb-mis-nas-credentials
+```
+
+Add the following two lines, replacing the placeholders with your actual NAS backup account details:
+
+```
+username=<nas-backup-user>   # NAS account that has write access to the backup share
+password=<secret>            # Password for the NAS backup account
+```
+
+Lock down the file:
+
+```bash
+sudo chmod 600 /root/.smb-mis-nas-credentials
+```
+
+### Mount the Share Manually (Test First)
+
+```bash
+# Replace <nas-host>  with your NAS hostname or IP, e.g. 192.168.1.10 or nas.local
+# Replace <share>     with the SMB share name, e.g. backups
+sudo mount -t cifs //<nas-host>/<share> /mnt/mis-nas \
+  -o credentials=/root/.smb-mis-nas-credentials,vers=3.0
+```
+
+### Test a Manual rsync to the NAS
+
+```bash
+# Syncs the entire local backup directory to the NAS as the mssql user
+sudo -u mssql rsync -avh --partial --checksum \
+  /var/opt/mssql/backup/local/ \
+  /mnt/mis-nas/mis-server/
+```
+
+### Verify the Mount Is Active
+
+```bash
+findmnt /mnt/mis-nas
+```
+
+### Make the Mount Persistent in /etc/fstab
+
+First, look up the numeric UID and GID of the `mssql` service account:
+
+```bash
+id -u mssql   # Note this value — used as uid= in fstab
+id -g mssql   # Note this value — used as gid= in fstab
+```
+
+Add the following line to `/etc/fstab`, substituting every placeholder:
+
+```
+# Replace <nas-host>    with your NAS hostname or IP
+# Replace <share>       with your SMB share name
+# Replace <mssql_uid>   with the output of: id -u mssql
+# Replace <mssql_gid>   with the output of: id -g mssql
+//<nas-host>/<share> /mnt/mis-nas cifs \
+  credentials=/root/.smb-mis-nas-credentials,\
+  uid=<mssql_uid>,gid=<mssql_gid>,\
+  file_mode=0640,dir_mode=0750,\
+  vers=3.0,nofail,x-systemd.automount,_netdev \
+  0 0
+```
+
+Reload systemd and mount all filesystems:
+
+```bash
+sudo systemctl daemon-reload
+sudo mount -a
+```
+
+### Verify mssql Write Access
+
+```bash
+# Creates and immediately removes a test file as the mssql user
+sudo -u mssql sh -c 'touch /mnt/mis-nas/.mssql-write-test && rm /mnt/mis-nas/.mssql-write-test'
+```
+
+No output means the write test passed. An error message means a permissions or mount problem that must be resolved before the automated backup script can copy files to the NAS.
+
+---
+
+## Server Health Monitoring
+
+### Disk Space
+
+```bash
+df -h
+```
+
+Watch `/var/opt/mssql` and `/mnt/mis-nas`. Alert if either drops below 20% free.
+
+### Critical Service Status
+
+```bash
+# Check whether each named service is active (prints "active" or "inactive/failed")
+systemctl is-active mssql-server tailscaled ssh
+```
+
+### List Any Failed Units
+
+```bash
+systemctl --failed
+```
+
+### SQL Server Logs
+
+```bash
+# Show the last 100 lines from SQL Server since last boot
+journalctl -u mssql-server -b --no-pager | tail -n 100
+```
+
+### NVMe Drive Health (SMART)
+
+```bash
+# Replace /dev/nvme0 with your actual NVMe device path (check: lsblk)
+sudo nvme smart-log /dev/nvme0
+```
+
+Key fields to watch: `critical_warning` (must be 0), `media_errors` (must be 0), and `percentage_used` (plan for replacement above 90%).
+
+### SATA/SAS Drive Health (SMART)
+
+```bash
+# Replace /dev/sda with your actual SATA device path
+sudo smartctl -a /dev/sda
+```
+
+Look for `SMART overall-health self-assessment test result: PASSED` and zero `Reallocated_Sector_Ct` or `Pending_Sector_Count` values.
+
+### Network Routing
+
+```bash
+ip route
+```
+
+### Confirm SQL Server Port Is Listening
+
+```bash
+sudo ss -lntp | grep ':1433' || true
+```
+
+The `|| true` prevents the command from returning a non-zero exit code when used in scripts. You should see a line referencing `sqlservr` listening on `0.0.0.0:1433`.
+
+---
+
+## UPS (NUT) Setup
+
+### Install NUT
+
+```bash
+sudo apt install -y nut
+```
+
+### Detect the UPS USB Device
+
+```bash
+# List all USB devices to locate your UPS
+lsusb
+
+# Auto-scan for supported UPS devices on USB
+sudo nut-scanner -U
+```
+
+Note the driver and port values from the scanner output — you will need them for `ups.conf`.
+
+### Configure the UPS Driver
+
+```bash
+sudoedit /etc/nut/ups.conf
+```
+
+Add a `[ups]` block for your device. Refer to the `nut-scanner` output for the correct `driver` and `port` values:
+
+```ini
+# /etc/nut/ups.conf  (example — replace values with those from nut-scanner)
+[<ups-name>]                     # Replace with a short name, e.g. office-ups
+  driver = usbhid-ups            # Replace with the driver reported by nut-scanner
+  port   = auto
+  desc   = "MIS Server UPS"
+```
+
+### Configure the UPS Monitor
+
+```bash
+sudoedit /etc/nut/upsmon.conf
+```
+
+Add a `MONITOR` line pointing to your UPS:
+
+```
+# Replace <ups-name> with the name you chose in ups.conf
+MONITOR <ups-name>@localhost 1 admin <upsmon-password> master
+```
+
+### Enable UPS Services
+
+```bash
+sudo systemctl enable --now nut-driver nut-monitor
+```
+
+### Query Current UPS Status
+
+```bash
+# Replace <ups-name> with the name defined in ups.conf
+sudo upsc <ups-name>@localhost
+```
+
+Key fields: `ups.status` should be `OL` (on line); `battery.charge` should be 100; `ups.load` shows current load percentage.
+
+### Check UPS Service Health
+
+```bash
+sudo systemctl status nut-driver nut-monitor --no-pager
+```
+
+<Warning>
+  If `nut-driver` fails to start, confirm the UPS is connected to a USB port and that `nut-scanner -U` detects it. A mismatch between the driver name in `ups.conf` and the actual device is the most common cause of startup failure.
+</Warning>

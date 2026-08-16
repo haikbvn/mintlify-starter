@@ -1,0 +1,223 @@
+---
+title: "Local SQL Server Backup Setup and Automation"
+sidebarTitle: "Local Backup"
+description: "Configure directory layout, credentials, automated systemd backup jobs, and nightly verification for your MIS Production SQL Server instance."
+---
+
+Local backups are your first line of defence against data loss. Before you configure NAS replication or plan a disaster-recovery drill, you need a reliable, verified local backup running on a nightly schedule. This page walks you through creating the directory structure, storing credentials safely, writing the backup script, and wiring everything up with a systemd timer.
+
+<Warning>
+SQL Server Express does **not** support `WITH COMPRESSION`. Omit the compression clause or your backup command will fail with an unsupported-feature error.
+</Warning>
+
+## Create Backup Directories
+
+<Steps>
+  <Step title="Create the local and incoming backup directories">
+    Run the following command to create both directories in one step, owned by the `mssql` service account with permissions set to `0750`:
+
+    ```bash
+    sudo install -d -o mssql -g mssql -m 0750 \
+      /var/opt/mssql/backup/local \
+      /var/opt/mssql/backup/incoming
+    ```
+
+    <Note>
+      The `install -d` form is preferred over `mkdir` followed by `chown`/`chmod` because it is atomic — ownership and permissions are set at creation time.
+    </Note>
+  </Step>
+</Steps>
+
+## Store Credentials Safely
+
+Never embed database passwords in a backup script. Instead, create a protected environment file that the script sources at runtime.
+
+<Steps>
+  <Step title="Create the credential directory">
+    ```bash
+    sudo install -d -m 0700 /etc/mis-backup
+    ```
+  </Step>
+
+  <Step title="Write the environment file">
+    ```bash
+    sudoedit /etc/mis-backup/backup.env
+    ```
+
+    Populate the file with your dedicated backup login details:
+
+    ```bash
+    SQLCMD_USER=<dedicated-backup-login>
+    SQLCMDPASSWORD=<secret-kept-only-on-server>
+    MIS_DATABASE=<MIS_DATABASE>
+    ```
+
+    <Warning>
+      Use a **dedicated** SQL login for backups — do not reuse the `sa` account or any application login. Grant this login only the permissions it needs (`BACKUP DATABASE`).
+    </Warning>
+  </Step>
+
+  <Step title="Lock down file permissions">
+    ```bash
+    sudo chmod 600 /etc/mis-backup/backup.env
+    ```
+  </Step>
+</Steps>
+
+## Run a Manual Backup
+
+Before automating anything, confirm that you can take a backup and verify it by hand.
+
+<Steps>
+  <Step title="Take a full database backup">
+    Connect to SQL Server and run:
+
+    ```sql
+    BACKUP DATABASE [<MIS_DATABASE>]
+    TO DISK = N'/var/opt/mssql/backup/local/<MIS_DATABASE>_YYYYMMDD.bak'
+    WITH CHECKSUM, INIT, STATS = 10;
+    GO
+    ```
+
+    `CHECKSUM` instructs SQL Server to compute and embed a page-level checksum. `INIT` overwrites an existing file rather than appending a new backup set.
+  </Step>
+
+  <Step title="Verify the backup file">
+    ```sql
+    RESTORE VERIFYONLY
+    FROM DISK = N'/var/opt/mssql/backup/local/<MIS_DATABASE>_YYYYMMDD.bak'
+    WITH CHECKSUM;
+    GO
+    ```
+
+    <Warning>
+      `VERIFYONLY` checks the backup header and page checksums but does **not** perform an actual restore. A backup is only trustworthy after a successful restore drill on a separate test database. See [Restore & Disaster Recovery](/backup/restore-dr) for the full procedure.
+    </Warning>
+  </Step>
+</Steps>
+
+## Install the Automated Backup Script
+
+<Steps>
+  <Step title="Create the script file">
+    Create `/usr/local/sbin/mis-sql-backup` with the following content:
+
+    ```bash
+    #!/usr/bin/env bash
+    set -Eeuo pipefail
+    source /etc/mis-backup/backup.env
+
+    stamp=$(date +%F_%H%M%S)
+    file="/var/opt/mssql/backup/local/${MIS_DATABASE}_${stamp}.bak"
+    sqlcmd=/opt/mssql-tools18/bin/sqlcmd
+
+    export SQLCMDPASSWORD
+
+    # Take the backup
+    "$sqlcmd" -b -S localhost -U "$SQLCMD_USER" -C \
+      -Q "BACKUP DATABASE [$MIS_DATABASE] TO DISK = N'$file' WITH CHECKSUM, INIT, STATS = 10;"
+
+    # Verify immediately — copy only happens after this passes
+    "$sqlcmd" -b -S localhost -U "$SQLCMD_USER" -C \
+      -Q "RESTORE VERIFYONLY FROM DISK = N'$file' WITH CHECKSUM;"
+
+    # Copy to NAS if mounted
+    if mountpoint -q /mnt/mis-nas; then
+      sudo -u mssql rsync -avh --partial --checksum "$file" /mnt/mis-nas/mis-server/
+    fi
+
+    # Prune local files older than 14 days
+    find /var/opt/mssql/backup/local -type f -name '*.bak' -mtime +14 -print -delete
+    ```
+
+    <Note>
+      The `set -Eeuo pipefail` line causes the script to abort immediately on any error. If the `BACKUP` command fails, `VERIFYONLY` and the NAS copy are both skipped automatically.
+    </Note>
+  </Step>
+
+  <Step title="Set the correct permissions">
+    ```bash
+    sudo chmod 700 /usr/local/sbin/mis-sql-backup
+    ```
+
+    Only `root` should be able to read or execute the script, since it sources a file containing credentials.
+  </Step>
+</Steps>
+
+## Configure the systemd Service and Timer
+
+<Steps>
+  <Step title="Create the service unit">
+    Create `/etc/systemd/system/mis-sql-backup.service`:
+
+    ```ini
+    [Unit]
+    Description=MIS SQL backup, verification and NAS copy
+    After=mssql-server.service network-online.target
+    Wants=network-online.target
+
+    [Service]
+    Type=oneshot
+    ExecStart=/usr/local/sbin/mis-sql-backup
+    ```
+  </Step>
+
+  <Step title="Create the timer unit">
+    Create `/etc/systemd/system/mis-sql-backup.timer`:
+
+    ```ini
+    [Unit]
+    Description=Run MIS SQL backup every night
+
+    [Timer]
+    OnCalendar=*-*-* 23:30:00
+    Persistent=true
+
+    [Install]
+    WantedBy=timers.target
+    ```
+
+    <Tip>
+      `Persistent=true` means that if the server was powered off at 23:30, systemd will run the backup job as soon as the server next starts up — so you will not silently skip a night's backup after a reboot.
+    </Tip>
+  </Step>
+
+  <Step title="Reload systemd and enable the timer">
+    ```bash
+    sudo systemctl daemon-reload
+    sudo systemctl enable --now mis-sql-backup.timer
+    ```
+  </Step>
+
+  <Step title="Confirm the timer is scheduled">
+    ```bash
+    systemctl list-timers mis-sql-backup.timer
+    ```
+
+    You should see the timer listed with a **NEXT** time in the future and an **ACTIVATES** column pointing to `mis-sql-backup.service`.
+  </Step>
+
+  <Step title="Run a manual test">
+    Trigger the service immediately without waiting for the scheduled time:
+
+    ```bash
+    sudo systemctl start mis-sql-backup.service
+    ```
+
+    Then inspect the output:
+
+    ```bash
+    sudo journalctl -u mis-sql-backup.service -n 100 --no-pager
+    ```
+
+    A successful run ends with lines from `rsync` (if the NAS is mounted) and a `find` pruning report, with exit code `0` reported by systemd.
+  </Step>
+</Steps>
+
+## Local Retention Policy
+
+The backup script automatically deletes local `.bak` files older than **14 days** via the `find … -mtime +14 -delete` line. This keeps disk usage bounded while retaining two weeks of daily recovery points.
+
+<Tip>
+  Check your available disk space with `df -h /var/opt/mssql/backup/local` before the first automated run. A typical uncompressed full backup of a small MIS database is a few hundred megabytes; multiply by 14 to estimate peak usage.
+</Tip>

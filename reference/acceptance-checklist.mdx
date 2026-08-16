@@ -1,0 +1,94 @@
+---
+title: "MIS Server Deployment Acceptance Checklist"
+sidebarTitle: "Acceptance Checklist"
+description: "Structured go-live checklist covering OS, security, SQL Server, backup, and disaster recovery acceptance criteria — plus a post-acceptance record-keeping template."
+---
+
+Complete every item in this checklist before you declare the MIS server production-ready. Work through each section in order: infrastructure first, then security, then SQL Server, then backup and disaster recovery. Record the server's key attributes in the [Post-Acceptance Information](#post-acceptance-information) table at the bottom of the page so the next operator has a single reference point.
+
+Use the ✓ column as a visual confirmation that you have personally verified each item. Do not mark an item ✓ based on assumption — run the relevant command or test and observe the result with your own eyes.
+
+---
+
+## OS and Hardware
+
+| # | Item | How to Verify | ✓ |
+|---|------|---------------|---|
+| 1 | Ubuntu Server 24.04 LTS installed | `lsb_release -a` → `Release: 24.04` | ✓ |
+| 2 | Architecture is x86_64 | `uname -m` → `x86_64` | ✓ |
+| 3 | Hostname is correct | `hostname -f` matches the agreed name | ✓ |
+| 4 | Static LAN IP configured | `ip addr` shows the correct address; ping the gateway | ✓ |
+| 5 | NTP synchronised | `timedatectl status` → `System clock synchronized: yes` | ✓ |
+| 6 | UPS operational and load detected | `sudo upsc <ups-name>@localhost` → `ups.status: OL` | ✓ |
+| 7 | SMART — no critical errors | `sudo nvme smart-log /dev/nvme0` or `sudo smartctl -a /dev/sda` → no warnings | ✓ |
+
+---
+
+## Security and Network
+
+| # | Item | How to Verify | ✓ |
+|---|------|---------------|---|
+| 8 | SSH key login works | Log in with your private key; confirm no password prompt | ✓ |
+| 9 | Root SSH login disabled | `PermitRootLogin no` present in `/etc/ssh/sshd_config.d/99-mis-hardening.conf` | ✓ |
+| 10 | Password SSH disabled | `PasswordAuthentication no` present in hardening config; attempt a password login and confirm it is rejected | ✓ |
+| 11 | UFW active with correct rules | `sudo ufw status verbose` — only ports 22 and 1433 open, scoped to LAN CIDRs and `tailscale0` | ✓ |
+| 12 | TCP 1433 not exposed to the Internet | Confirm no port-forward rule exists on the WAN router; run `nmap` from outside LAN | ✓ |
+| 13 | Tailscale online | `tailscale status` → server node shows as connected | ✓ |
+| 14 | MagicDNS resolves the server | `tailscale ping <mis-server-magicdns-name>` from a peer node succeeds | ✓ |
+| 15 | Tailscale ACL grants correct | `Test-NetConnection <mis-server-magicdns-name> -Port 1433` → True from `tag:mis-client`; port 22 → False | ✓ |
+
+---
+
+## SQL Server and MIS Database
+
+| # | Item | How to Verify | ✓ |
+|---|------|---------------|---|
+| 16 | SQL Server 2025 Express installed | `SELECT SERVERPROPERTY('Edition');` → `Express Edition (64-bit)` | ✓ |
+| 17 | mssql-server enabled and active | `systemctl is-active mssql-server` → `active` | ✓ |
+| 18 | TCP 1433 listening | `sudo ss -lntp \| grep ':1433'` → `sqlservr` present | ✓ |
+| 19 | MIS database state is ONLINE | `SELECT name, state_desc FROM sys.databases;` → MIS row shows `ONLINE` | ✓ |
+| 20 | DBCC CHECKDB passes | `DBCC CHECKDB (N'<MIS_DATABASE>') WITH NO_INFOMSGS;` → zero output | ✓ |
+| 21 | MIS application login works | Connect with the MIS application credentials; run a representative query | ✓ |
+| 22 | All client workstations connect | Each Windows MIS client successfully opens the application and performs a test transaction | ✓ |
+
+---
+
+## Backup and Disaster Recovery
+
+| # | Item | How to Verify | ✓ |
+|---|------|---------------|---|
+| 23 | Manual backup succeeds | Run `sudo systemctl start mis-sql-backup.service`; confirm exit code 0 | ✓ |
+| 24 | RESTORE VERIFYONLY passes | The backup script runs `RESTORE VERIFYONLY` automatically; check logs via `journalctl` | ✓ |
+| 25 | Full restore test passes | Restore the latest backup to a test database name; confirm `DBCC CHECKDB` passes on the restored copy | ✓ |
+| 26 | NAS copy succeeds | After the backup service runs, confirm the `.bak` file appears under `/mnt/mis-nas/mis-server/` | ✓ |
+| 27 | Retention policy configured | Backups older than 14 days are pruned from `/var/opt/mssql/backup/local`; define separate NAS retention policy as needed | ✓ |
+| 28 | Automated backup timer active | `systemctl list-timers mis-sql-backup.timer` → next trigger time shown | ✓ |
+| 29 | Reboot test passes | `sudo reboot`; after restart confirm items 17–18 and 28 are still met | ✓ |
+| 30 | Disaster recovery drill complete | Delete the test database, restore from NAS backup, verify data integrity end-to-end | ✓ |
+| 31 | RPO/RTO actuals recorded | Fill in the measured values in the Post-Acceptance Information table below | ✓ |
+
+---
+
+## Post-Acceptance Information
+
+Record these values immediately after the server passes all checklist items above. Store this completed page alongside the deployment runbook.
+
+| Field | Value |
+|-------|-------|
+| Hostname | |
+| LAN IP address | |
+| Default gateway | |
+| Tailscale MagicDNS hostname | |
+| SQL Server version and build | |
+| SQL Server edition | Express Edition (64-bit) |
+| MIS database name | |
+| MIS database size (MB) | |
+| NAS backup path | `//<nas-host>/<share>/mis-server/` |
+| Date of last successful backup | |
+| Date of restore drill | |
+| Measured RPO (minutes) | |
+| Measured RTO (minutes) | |
+
+<Note>
+  Update the **Date of last successful backup** row after every scheduled maintenance window or any event that triggers an out-of-band backup. The RPO and RTO values should be re-measured after any significant change to the backup or network configuration.
+</Note>

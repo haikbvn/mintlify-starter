@@ -1,19 +1,11 @@
 {
-  "$schema": "https://mintlify.com/docs.json",
-  "name": "MIS Production Server",
+  "projectType": "infrastructure",
+  "projectName": "MIS Production Server",
+  "projectDescription": "A production runbook for deploying and operating a self-hosted MIS server on Ubuntu 24.04 LTS with SQL Server 2025 Express, secured via Tailscale, UFW, and backed up to NAS.",
   "theme": "aspen",
-  "colors": {
-    "primary": "#ef7025",
-    "light": "#eec9bc",
-    "dark": "#4fa1ab"
-  },
-  "favicon": "/favicon.svg",
-  "navbar": {
-    "primary": {
-      "type": "github",
-      "href": "https://github.com/mis-server"
-    }
-  },
+  "primaryColor": "#ef7025",
+  "lightColor": "#eec9bc",
+  "darkColor": "#4fa1ab",
   "navigation": {
     "tabs": [
       {
@@ -93,5 +85,32 @@
         ]
       }
     ]
-  }
+  },
+  "keyFeatures": [
+    "Ubuntu Server 24.04 LTS as the production OS running 24/7",
+    "SQL Server 2025 Express running natively (no Docker)",
+    "Tailscale + MagicDNS for secure zero-trust remote access",
+    "UFW host firewall with least-privilege rules",
+    "Automated nightly backups via systemd timers with VERIFY step",
+    "NAS off-server backup with daily/weekly/monthly retention",
+    "UPS graceful shutdown via NUT integration",
+    "Defense-in-depth: Tailscale policy + UFW + SQL authentication",
+    "Disaster recovery with RPO ≤ 24h and RTO ≤ 4h targets",
+    "DBCC CHECKDB periodic integrity verification"
+  ],
+  "publicApiSurface": [
+    "sqlcmd — SQL Server command-line tool",
+    "mssql-conf — SQL Server configuration utility",
+    "tailscale up / tailscale set --ssh — Tailscale CLI",
+    "tailscale status / tailscale ping — connectivity checks",
+    "ufw allow / ufw status — UFW firewall management",
+    "netplan apply / netplan try — network configuration",
+    "systemctl enable/start mis-sql-backup.timer — automated backup",
+    "BACKUP DATABASE ... WITH CHECKSUM — SQL backup command",
+    "RESTORE VERIFYONLY — backup verification",
+    "RESTORE DATABASE ... WITH MOVE — database restore",
+    "DBCC CHECKDB — database integrity check",
+    "rsync — NAS backup copy",
+    "nut-scanner / upsc — UPS monitoring"
+  ]
 }

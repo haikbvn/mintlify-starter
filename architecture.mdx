@@ -1,0 +1,144 @@
+---
+title: "MIS Production Server Architecture & Data Flow"
+sidebarTitle: "Architecture"
+description: "Understand the component layout, network trust boundaries, client access paths, backup flow, and security model of the MIS production server."
+---
+
+The MIS production server is a single physical machine running Ubuntu Server 24.04 LTS with SQL Server 2025 Express installed directly on the OS — no containers, no virtual machines. Keeping the stack simple reduces operational overhead and eliminates an entire class of networking and storage abstraction problems that would complicate diagnostics and backup.
+
+## Component Map
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                        MIS Server                           │
+│  hostname: mis-server                                       │
+│                                                             │
+│  ┌──────────────────┐    ┌──────────────────────────────┐  │
+│  │  SQL Server 2025  │    │  systemd services            │  │
+│  │  Express          │    │  · mssql-server              │  │
+│  │  TCP :1433        │    │  · tailscaled                │  │
+│  │  (native, no      │    │  · ufw                       │  │
+│  │   Docker)         │    │  · ssh                       │  │
+│  └──────────────────┘    └──────────────────────────────┘  │
+│                                                             │
+│  ┌──────────────────────────────────────────────────────┐  │
+│  │  Storage                                              │  │
+│  │  · OS NVMe/SSD  (/var/opt/mssql  +  /srv/sqlbackup)  │  │
+│  │  · NAS mount    (/mnt/nas-backup)                     │  │
+│  └──────────────────────────────────────────────────────┘  │
+└─────────────────────────────────────────────────────────────┘
+         │ LAN TCP 1433                   │ Tailscale TCP 1433/22
+         ▼                                ▼
+┌─────────────────┐             ┌──────────────────────┐
+│  Windows MIS    │             │  Windows MIS Client   │
+│  Clients (LAN)  │             │  (remote / Tailscale) │
+└─────────────────┘             └──────────────────────┘
+                                          │
+                                          │ Tailscale SSH :22
+                                          ▼
+                                ┌──────────────────────┐
+                                │  Administrator       │
+                                │  (shell access only) │
+                                └──────────────────────┘
+```
+
+## Network Trust Boundaries
+
+The server operates across three distinct network zones. UFW and Tailscale ACLs enforce the boundary between each zone.
+
+<CardGroup cols={3}>
+  <Card title="LAN Zone" icon="house-chimney-network">
+    Trusted wired LAN. MIS clients connect to SQL Server on TCP 1433. UFW permits only specific LAN CIDRs — not the whole internet.
+  </Card>
+  <Card title="Tailscale Zone" icon="lock">
+    Encrypted overlay network. Remote MIS clients and the administrator connect through the `tailscale0` interface. SSH and SQL Server are permitted only on this interface, not on the public NIC.
+  </Card>
+  <Card title="Internet" icon="globe">
+    Untrusted. No inbound rules exist for the public internet. Port 22 and port 1433 are **never** reachable from the internet — not through UFW, and not through router port-forwarding.
+  </Card>
+</CardGroup>
+
+### Port Access Matrix
+
+| Port | Protocol | LAN | Tailscale | Internet |
+|---|---|---|---|---|
+| 22 (SSH) | TCP | Restricted to mgmt CIDR | ✅ Allowed | ❌ Blocked |
+| 1433 (SQL Server) | TCP | Restricted to client CIDR | ✅ Allowed | ❌ Blocked |
+| All other inbound | — | ❌ Blocked | ❌ Blocked | ❌ Blocked |
+
+<Warning>
+The router must **never** have a port-forwarding rule for TCP 1433 or TCP 22 pointing at this server. If you discover such a rule, remove it immediately and treat it as a security incident.
+</Warning>
+
+## Client Access Paths
+
+Windows MIS clients connect to SQL Server using the standard SQL Server connection string format. The server address is either the LAN IP (for wired clients) or the Tailscale IP (for remote clients).
+
+**LAN client connection string example:**
+```
+Server=192.168.1.74,1433;Database=MISDatabase;Integrated Security=False;...
+```
+
+**Tailscale client connection string example:**
+```
+Server=100.x.y.z,1433;Database=MISDatabase;Integrated Security=False;...
+```
+
+<Note>
+Replace `192.168.1.74` and `100.x.y.z` with your actual LAN IP and Tailscale IP respectively. Never use placeholder values in production connection strings.
+</Note>
+
+## Backup Data Flow
+
+Backups move in two hops. SQL Server writes to a local staging directory first, then a scheduled script copies completed backup files to the NAS. This two-hop design means a NAS outage never blocks the primary backup job.
+
+```
+SQL Server
+    │
+    │  1. BACKUP DATABASE → /srv/sqlbackup/
+    │     (local NVMe/SSD staging, 14-day retention)
+    │
+    ▼
+Local Staging (/srv/sqlbackup/)
+    │
+    │  2. rsync / robocopy → /mnt/nas-backup/
+    │     (NAS, daily 14d · weekly 8w · monthly 12mo)
+    │
+    ▼
+NAS (/mnt/nas-backup/)
+```
+
+### Backup Retention Policy
+
+| Tier | Location | Frequency | Retention |
+|---|---|---|---|
+| Local staging | `/srv/sqlbackup/` on OS disk | Daily (or per schedule) | 14 days |
+| NAS daily | `/mnt/nas-backup/daily/` | Daily | 14 days |
+| NAS weekly | `/mnt/nas-backup/weekly/` | Weekly | 8 weeks |
+| NAS monthly | `/mnt/nas-backup/monthly/` | Monthly | 12 months |
+
+<Warning>
+You must always have at least **two independent copies** of every backup — the local staging copy and the NAS copy. If the NAS is offline, fix it before declaring the backup policy satisfied, even if the local copy exists.
+</Warning>
+
+## Software Stack
+
+| Layer | Component | Notes |
+|---|---|---|
+| Hardware | Physical x86-64 server | UPS attached |
+| OS | Ubuntu Server 24.04 LTS | No GUI, no Docker |
+| Database | SQL Server 2025 Express | Runs as `mssql` service user |
+| Overlay network | Tailscale | Provides remote access + admin SSH |
+| Firewall | UFW (Uncomplicated Firewall) | Managed via CLI, deny-by-default inbound |
+| Backup transport | rsync + bash/systemd timers | Copies from staging to NAS |
+| Monitoring | systemd, smartmontools, NUT (UPS) | Journal + SMART + UPS events |
+
+## Operational Principles Reflected in This Architecture
+
+Every architectural decision maps back to a concrete principle:
+
+- **No Docker for SQL Server** → eliminates container networking complexity and simplifies backup path configuration.
+- **Tailscale for remote access** → eliminates the need to open any inbound ports on the router.
+- **Two-hop backup** → NAS unavailability never silently skips a backup; the local copy always exists first.
+- **UFW deny-by-default** → any new service you install is blocked until you explicitly allow it, preventing accidental exposure.
+- **No GUI desktop** → reduces attack surface, package count, and RAM consumption.

@@ -1,0 +1,253 @@
+---
+title: "SQL Backup, Restore & Automation Command Reference"
+sidebarTitle: "Backup Commands"
+description: "All T-SQL and bash commands for MIS database backup, restore verification, integrity checks, and the automated nightly systemd backup timer setup."
+---
+
+This page consolidates every command and configuration file involved in MIS database backup and recovery — from copying a `.bak` file to the server through to configuring the nightly systemd timer that runs automatically. Work through the sections in order during initial setup; use individual sections as a reference during operations or disaster recovery.
+
+## Prepare Backup Directories
+
+Create the local backup directory and the incoming directory used for migration `.bak` files. Both are owned by the `mssql` service account.
+
+```bash
+sudo install -d -o mssql -g mssql -m 0750 \
+  /var/opt/mssql/backup/local \
+  /var/opt/mssql/backup/incoming
+```
+
+---
+
+## Migration: Copy and Verify an Existing Backup
+
+### Stage the Backup File
+
+```bash
+# Replace /path/to/<MIS_DATABASE>.bak with the actual path to your backup file
+# Replace <MIS_DATABASE> with your database name, e.g. MIS_Production
+sudo cp /path/to/<MIS_DATABASE>.bak /var/opt/mssql/backup/incoming/
+
+# Fix ownership so SQL Server can read the file
+sudo chown mssql:mssql /var/opt/mssql/backup/incoming/<MIS_DATABASE>.bak
+```
+
+### Verify the Backup Is Readable
+
+```sql
+-- Replace <MIS_DATABASE> with your actual database filename
+RESTORE VERIFYONLY
+FROM DISK = N'/var/opt/mssql/backup/incoming/<MIS_DATABASE>.bak';
+GO
+```
+
+### Identify Logical File Names
+
+You need the logical data and log file names before you can run `RESTORE DATABASE`.
+
+```sql
+-- Replace <MIS_DATABASE> with your actual database filename
+RESTORE FILELISTONLY
+FROM DISK = N'/var/opt/mssql/backup/incoming/<MIS_DATABASE>.bak';
+GO
+```
+
+Note the `LogicalName` values from the result — you will use them as `<LOGICAL_DATA_NAME>` and `<LOGICAL_LOG_NAME>` in the restore command below.
+
+### Restore the Database
+
+```sql
+-- Replace all angle-bracket placeholders with your real values:
+--   <MIS_DATABASE>       : your database name, e.g. MIS_Production
+--   <LOGICAL_DATA_NAME>  : data file logical name from FILELISTONLY
+--   <LOGICAL_LOG_NAME>   : log file logical name from FILELISTONLY
+RESTORE DATABASE [<MIS_DATABASE>]
+FROM DISK = N'/var/opt/mssql/backup/incoming/<MIS_DATABASE>.bak'
+WITH
+  MOVE N'<LOGICAL_DATA_NAME>' TO N'/var/opt/mssql/data/<MIS_DATABASE>.mdf',
+  MOVE N'<LOGICAL_LOG_NAME>'  TO N'/var/opt/mssql/data/<MIS_DATABASE>_log.ldf',
+  RECOVERY,
+  STATS = 10;
+GO
+```
+
+---
+
+## Manual Backup with Checksum
+
+Run this from `sqlcmd` or SSMS to produce a verified backup to the local backup directory.
+
+```sql
+-- Replace <MIS_DATABASE>  with your database name
+-- Replace YYYYMMDD        with today's date, e.g. 20250615
+BACKUP DATABASE [<MIS_DATABASE>]
+TO DISK = N'/var/opt/mssql/backup/local/<MIS_DATABASE>_YYYYMMDD.bak'
+WITH CHECKSUM, INIT, STATS = 10;
+GO
+```
+
+Immediately verify the resulting file:
+
+```sql
+RESTORE VERIFYONLY
+FROM DISK = N'/var/opt/mssql/backup/local/<MIS_DATABASE>_YYYYMMDD.bak'
+WITH CHECKSUM;
+GO
+```
+
+---
+
+## Integrity Check
+
+Run `DBCC CHECKDB` after a restore and before signing off on any maintenance window.
+
+```sql
+-- Replace <MIS_DATABASE> with your database name
+DBCC CHECKDB (N'<MIS_DATABASE>') WITH NO_INFOMSGS;
+GO
+```
+
+A clean run produces no output. Any output indicates corruption that needs immediate investigation.
+
+---
+
+## Automated Nightly Backup
+
+### Create a Dedicated Backup SQL Login
+
+Run these T-SQL statements as the `sa` account or another SQL admin. Replace the placeholders with your chosen login name and a strong, randomly generated password.
+
+```sql
+-- Replace <backup_login>   with a login name, e.g. svc_backup
+-- Replace <strong-secret>  with a strong random password
+CREATE LOGIN [<backup_login>]
+  WITH PASSWORD = N'<strong-secret>', CHECK_POLICY = ON;
+GO
+
+USE [<MIS_DATABASE>]; -- Replace with your database name
+CREATE USER [<backup_login>] FOR LOGIN [<backup_login>];
+ALTER ROLE db_backupoperator ADD MEMBER [<backup_login>];
+GO
+
+USE [master];
+GRANT CREATE ANY DATABASE TO [<backup_login>];
+GO
+```
+
+### Store Credentials in an Environment File
+
+```bash
+# Create the credentials directory (owner: root, mode: 0700)
+sudo install -d -m 0700 /etc/mis-backup
+
+# Open the env file in your editor
+sudoedit /etc/mis-backup/backup.env
+```
+
+Add the following content to `/etc/mis-backup/backup.env`, replacing all placeholders:
+
+```bash
+# /etc/mis-backup/backup.env
+SQLCMD_USER=<backup_login>       # The SQL login name you created above
+SQLCMDPASSWORD=<strong-secret>   # The SQL login password — keep this file off version control
+MIS_DATABASE=<MIS_DATABASE>      # Your database name, e.g. MIS_Production
+```
+
+Lock down the file permissions:
+
+```bash
+sudo chmod 600 /etc/mis-backup/backup.env
+```
+
+### Install the Backup Script
+
+Create `/usr/local/sbin/mis-sql-backup` with the following content:
+
+```bash
+#!/usr/bin/env bash
+# /usr/local/sbin/mis-sql-backup
+# Nightly MIS SQL Server backup: local snapshot + verify + NAS copy + retention pruning.
+set -Eeuo pipefail
+
+source /etc/mis-backup/backup.env
+
+stamp=$(date +%F_%H%M%S)
+file="/var/opt/mssql/backup/local/${MIS_DATABASE}_${stamp}.bak"
+sqlcmd=/opt/mssql-tools18/bin/sqlcmd
+
+export SQLCMDPASSWORD
+
+# Take a checksummed backup
+"$sqlcmd" -b -S localhost -U "$SQLCMD_USER" -C \
+  -Q "BACKUP DATABASE [$MIS_DATABASE] TO DISK = N'$file' WITH CHECKSUM, INIT, STATS = 10;"
+
+# Verify the backup immediately
+"$sqlcmd" -b -S localhost -U "$SQLCMD_USER" -C \
+  -Q "RESTORE VERIFYONLY FROM DISK = N'$file' WITH CHECKSUM;"
+
+# Copy to NAS if the mount is active
+if mountpoint -q /mnt/mis-nas; then
+  sudo -u mssql rsync -avh --partial --checksum "$file" /mnt/mis-nas/mis-server/
+fi
+
+# Prune local backups older than 14 days
+find /var/opt/mssql/backup/local -type f -name '*.bak' -mtime +14 -print -delete
+```
+
+### Install the systemd Service Unit
+
+Create `/etc/systemd/system/mis-sql-backup.service`:
+
+```ini
+# /etc/systemd/system/mis-sql-backup.service
+[Unit]
+Description=MIS SQL backup, verification and NAS copy
+After=mssql-server.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/mis-sql-backup
+```
+
+### Install the systemd Timer Unit
+
+Create `/etc/systemd/system/mis-sql-backup.timer`:
+
+```ini
+# /etc/systemd/system/mis-sql-backup.timer
+[Unit]
+Description=Run MIS SQL backup every night
+
+[Timer]
+OnCalendar=*-*-* 23:30:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+```
+
+### Enable and Test the Timer
+
+```bash
+# Make the script executable
+sudo chmod 700 /usr/local/sbin/mis-sql-backup
+
+# Reload systemd to pick up the new units
+sudo systemctl daemon-reload
+
+# Enable and start the timer
+sudo systemctl enable --now mis-sql-backup.timer
+
+# Confirm the timer is scheduled
+systemctl list-timers mis-sql-backup.timer
+
+# Run a manual test immediately (watch the output for errors)
+sudo systemctl start mis-sql-backup.service
+
+# Review the last 100 log lines from the service
+sudo journalctl -u mis-sql-backup.service -n 100 --no-pager
+```
+
+<Tip>
+  A successful manual run produces lines showing `BACKUP DATABASE` progress percentages followed by `RESTORE VERIFYONLY succeeded`. If you see any error output, check `/etc/mis-backup/backup.env` for typos and confirm the NAS mount is active.
+</Tip>

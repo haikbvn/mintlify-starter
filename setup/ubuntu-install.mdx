@@ -1,0 +1,228 @@
+---
+title: "Installing Ubuntu Server 24.04 LTS on the MIS Server"
+sidebarTitle: "Ubuntu Install"
+description: "Step-by-step guide to installing Ubuntu Server 24.04 LTS, performing first-boot verification, setting the timezone, and installing essential system tools."
+---
+
+Ubuntu Server 24.04 LTS is the foundation every other component in this stack depends on. A clean, verified installation with the correct hostname, locale, and package baseline saves you hours of troubleshooting later. This page walks you through the install process, the mandatory first-boot checks, and the tool installations you need before proceeding to networking and SQL Server setup.
+
+## What You Need Before Starting
+
+- A USB drive (≥ 4 GB) flashed with the [Ubuntu Server 24.04 LTS ISO](https://ubuntu.com/download/server) (64-bit x86-64)
+- Physical or iDRAC/iLO console access to the server
+- The hostname you will assign: `mis-server`
+- A username for the dedicated admin account (for example, `hainguyen`)
+- Your planned static IP, gateway, and DNS values (you can use DHCP during install and switch to static afterwards)
+
+<Note>
+Download the **Server** ISO, not the Desktop ISO. The Desktop edition installs a GUI and a much larger package set. This server must not run a graphical desktop environment.
+</Note>
+
+## Installation
+
+<Steps>
+  <Step title="Boot from the USB Installer">
+    Insert the USB drive and power on the server. Enter the boot device menu (commonly F11 or F12) and select the USB drive. The Ubuntu Server installer starts in text mode.
+  </Step>
+
+  <Step title="Select Language and Keyboard">
+    Choose **English** (or your preferred language) and select the appropriate keyboard layout. The installer will proceed to the network configuration screen.
+  </Step>
+
+  <Step title="Configure Network (DHCP for Now)">
+    At the network configuration screen, you can accept a DHCP lease. You will assign a static IP using Netplan after the first boot. Note the DHCP address the installer assigns — you will need it to SSH in before you configure static networking.
+
+    <Tip>
+    If your switch requires a static IP to grant network access, configure the static IP here. The installer supports manual address entry on the same screen.
+    </Tip>
+  </Step>
+
+  <Step title="Leave Proxy Blank">
+    Unless your network routes all internet traffic through an HTTP proxy, leave the proxy address field empty and continue.
+  </Step>
+
+  <Step title="Use the Default Ubuntu Archive Mirror">
+    Accept the default package mirror unless you have a local apt mirror. The installer will test connectivity and proceed.
+  </Step>
+
+  <Step title="Configure Storage">
+    Select **Use an Entire Disk** and choose your NVMe/SSD. Enable **LVM** if you want volume management flexibility (recommended). Leave the option to encrypt the disk unchecked — full-disk encryption on a headless server prevents unattended boot after a power event.
+
+    <Warning>
+    Do **not** select the NAS disk or any external drive as the installation target. Double-check the disk size shown in the installer matches your OS SSD.
+    </Warning>
+  </Step>
+
+  <Step title="Set Hostname and Admin User">
+    When prompted for the server name, enter:
+
+    ```
+    mis-server
+    ```
+
+    Enter the admin username (for example `hainguyen`) and a strong password. You will disable password-based SSH login after setting up key authentication, but you need a password for local console access.
+
+    <Note>
+    Choose a real username specific to your organisation, not a generic name like `admin` or `ubuntu`. The username becomes part of audit logs and SSH authorisation records.
+    </Note>
+  </Step>
+
+  <Step title="Enable OpenSSH Server">
+    On the SSH configuration screen, check **Install OpenSSH server**. Leave "Import SSH identity" blank for now — you will push your public key after booting.
+  </Step>
+
+  <Step title="Skip Snap Packages">
+    The installer offers a list of featured server snaps. Uncheck everything. You will install only what this runbook specifies, from the apt repository.
+  </Step>
+
+  <Step title="Complete Installation and Reboot">
+    The installer copies files, installs the bootloader, and reboots. Remove the USB drive when prompted. The server should boot directly into Ubuntu Server.
+  </Step>
+</Steps>
+
+## First-Boot Verification
+
+After the server boots, log in on the console (or via SSH using the DHCP address noted earlier) and run the following checks. Do not proceed to any other setup step until all checks pass.
+
+<Steps>
+  <Step title="Confirm Architecture and OS Version">
+    ```bash
+    hostnamectl
+    uname -m
+    lsb_release -a
+    ```
+
+    Expected output:
+    - `hostnamectl` → Static hostname: `mis-server`, Operating System: Ubuntu 24.04 LTS
+    - `uname -m` → `x86_64`
+    - `lsb_release -a` → Release: `24.04`, Codename: `noble`
+
+    <Warning>
+    If `uname -m` returns anything other than `x86_64` (for example `aarch64`), stop. SQL Server 2025 Express does not run on ARM. You have the wrong ISO or the wrong hardware.
+    </Warning>
+  </Step>
+
+  <Step title="Verify RAM and Disk">
+    ```bash
+    free -h
+    lsblk -f
+    df -h
+    ```
+
+    Confirm:
+    - `free -h` → Total RAM matches your physical install (≥ 8 GB)
+    - `lsblk -f` → OS disk is present, formatted, and mounted
+    - `df -h` → `/` has the expected capacity from your OS SSD
+  </Step>
+
+  <Step title="Check for Failed systemd Units">
+    ```bash
+    systemctl --failed
+    ```
+
+    The output should show **0 loaded units listed**. Any failed units after a fresh install indicate a problem with the installation that you must investigate before continuing.
+  </Step>
+</Steps>
+
+## Timezone and NTP
+
+SQL Server relies on accurate system time for transaction logs, backup timestamps, and scheduled jobs. Set the timezone and confirm NTP synchronisation before installing any packages.
+
+<Steps>
+  <Step title="Set the Timezone">
+    ```bash
+    sudo timedatectl set-timezone Asia/Ho_Chi_Minh
+    ```
+
+    Replace `Asia/Ho_Chi_Minh` with your actual timezone if your server is in a different region. To list available timezones, run `timedatectl list-timezones`.
+  </Step>
+
+  <Step title="Verify Timezone and NTP Status">
+    ```bash
+    timedatectl status
+    timedatectl timesync-status
+    ```
+
+    Confirm:
+    - `Time zone` shows `Asia/Ho_Chi_Minh (ICT, +0700)` (or your chosen zone)
+    - `NTP service: active`
+    - `System clock synchronized: yes`
+
+    <Note>
+    Ubuntu 24.04 uses `systemd-timesyncd` for NTP by default. It is enabled automatically. If `NTP service` shows `inactive`, run `sudo systemctl enable --now systemd-timesyncd`.
+    </Note>
+  </Step>
+</Steps>
+
+## System Updates
+
+Apply all available updates immediately after the first boot. Running a fully patched baseline prevents you from re-encountering bugs that have already been fixed upstream.
+
+```bash
+sudo apt update
+sudo apt full-upgrade -y
+sudo reboot
+```
+
+<Warning>
+Use `full-upgrade` rather than `upgrade`. On Ubuntu 24.04, `full-upgrade` correctly handles packages that require removal or replacement as part of the update. Plain `upgrade` silently skips those packages, leaving the system partially updated.
+</Warning>
+
+## Install Essential Tools
+
+After the server reboots, install the baseline toolset. These packages are referenced throughout the rest of this runbook.
+
+```bash
+sudo apt install -y \
+  curl wget ca-certificates gnupg lsb-release \
+  vim nano htop tmux jq unzip rsync \
+  smartmontools nvme-cli \
+  dnsutils net-tools nmap \
+  cifs-utils
+```
+
+| Package | Purpose |
+|---|---|
+| `curl`, `wget` | Download SQL Server repo keys and packages |
+| `ca-certificates`, `gnupg` | GPG key verification for apt repos |
+| `vim`, `nano` | Text editors for config files |
+| `htop` | Interactive process and memory monitor |
+| `tmux` | Terminal multiplexer — keeps sessions alive over SSH |
+| `jq` | JSON parsing in shell scripts |
+| `rsync` | Backup file transfer to NAS |
+| `smartmontools` | Disk health monitoring via SMART |
+| `nvme-cli` | NVMe-specific disk diagnostics |
+| `dnsutils`, `net-tools`, `nmap` | Network diagnostics (`dig`, `ifconfig`, `nmap`) |
+| `cifs-utils` | Mount Windows/NAS SMB shares |
+
+## Post-Install Health Checks
+
+Run these checks after installing tools and before proceeding:
+
+```bash
+# Confirm no swap is in use (swap can degrade SQL Server performance)
+swapon --show
+
+# Review kernel and service errors from this boot
+journalctl -p 3 -b --no-pager
+```
+
+<Note>
+`swapon --show` producing no output means no swap is active, which is the expected state for a SQL Server host. If swap is active, consider disabling it or ensuring it is on the SSD rather than a slow disk.
+</Note>
+
+<Tip>
+If `journalctl -p 3 -b --no-pager` reports errors, search for the unit name in the output. Most errors at this stage are harmless cloud-init artefacts, but any error from `kernel`, `disk`, or `mssql` services warrants investigation.
+</Tip>
+
+## Checklist Before Moving On
+
+- [ ] `uname -m` returns `x86_64`
+- [ ] `lsb_release -a` shows Ubuntu 24.04 LTS (Noble)
+- [ ] `hostnamectl` shows hostname `mis-server`
+- [ ] RAM and disk match physical hardware
+- [ ] `systemctl --failed` shows 0 failed units
+- [ ] Timezone set correctly and NTP is synchronised
+- [ ] `sudo apt full-upgrade -y` completed successfully
+- [ ] All essential tools installed without errors
+- [ ] No critical errors in `journalctl -p 3 -b`

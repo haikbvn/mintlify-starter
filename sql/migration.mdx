@@ -1,0 +1,237 @@
+---
+title: "Migrate and Restore the MIS Production Database Backup"
+sidebarTitle: "Migration"
+description: "Pre-migration checklist, backup integrity verification, production restore steps, and backup automation login setup for the MIS SQL Server database."
+---
+
+Migrating the MIS database to a new SQL Server instance is a high-stakes, point-in-time operation. A mistake during restore can corrupt the target database or, worse, give you false confidence that the migration succeeded. Follow every step in order and do not skip the verification stages. The old server must remain intact and available until the MIS application team formally accepts the new instance.
+
+<Warning>
+  The placeholder `<MIS_DATABASE>` is used throughout this guide. **Do not guess the database name.** Confirm the exact database name with the MIS application team or database administrator before you run any command. Using the wrong name in a `RESTORE` statement will create an unintended database or overwrite the wrong one.
+</Warning>
+
+## Pre-Migration Checklist
+
+Gather this information before you touch any files or run any SQL commands. Every item must be confirmed — do not proceed if any item is unknown.
+
+- [ ] **SQL Server version** on the source and destination — confirm compatibility
+- [ ] **Exact database name** — confirmed with the MIS team (not guessed)
+- [ ] **Full `.bak` backup file** — obtained from the source server and verified present
+- [ ] **Database size** on the source — recorded for comparison after restore
+- [ ] **MIS application version** — confirmed, so you can validate post-restore behavior
+- [ ] **MIS client configuration** — server address and database name the client currently uses
+- [ ] **Old server status** — confirmed intact and in service; do not decommission until acceptance testing passes
+
+<Note>
+  If you are migrating between major SQL Server versions (for example, from SQL Server 2019 to 2025), check whether the MIS application supports the new compatibility level and confirm with the MIS vendor before proceeding.
+</Note>
+
+## Copy the Backup File to the Server
+
+SQL Server on Linux can only read backup files from paths that the `mssql` service account can access. The standard location is `/var/opt/mssql/backup/`.
+
+<Steps>
+  <Step title="Create the backup directories">
+    Create separate subdirectories for locally-generated backups and incoming restore files:
+
+    ```bash
+    sudo install -d -o mssql -g mssql -m 0750 \
+      /var/opt/mssql/backup/local \
+      /var/opt/mssql/backup/incoming
+    ```
+  </Step>
+
+  <Step title="Copy the backup file into the incoming directory">
+    Replace `/path/to/<MIS_DATABASE>.bak` with the actual path to your backup file:
+
+    ```bash
+    sudo cp /path/to/<MIS_DATABASE>.bak /var/opt/mssql/backup/incoming/
+    ```
+  </Step>
+
+  <Step title="Set correct ownership on the backup file">
+    SQL Server runs as the `mssql` user and must be able to read the file:
+
+    ```bash
+    sudo chown mssql:mssql /var/opt/mssql/backup/incoming/<MIS_DATABASE>.bak
+    ```
+  </Step>
+</Steps>
+
+## Verify Backup Integrity Before Restoring
+
+Never restore from a backup you have not verified. A corrupt backup will produce a corrupt — or failed — database restore.
+
+<Steps>
+  <Step title="Connect to SQL Server">
+    Open a `sqlcmd` session as `sa`:
+
+    ```bash
+    sqlcmd -S localhost -U sa -C
+    ```
+  </Step>
+
+  <Step title="Run RESTORE VERIFYONLY">
+    This command checks the backup file structure and checksums without writing anything to disk:
+
+    ```sql
+    RESTORE VERIFYONLY
+      FROM DISK = N'/var/opt/mssql/backup/incoming/<MIS_DATABASE>.bak';
+    GO
+    ```
+
+    **PASS:** The message `The backup set on file 1 is valid.` — proceed to the next step.
+
+    **FAIL:** Any error message — do not proceed. Obtain a fresh backup from the source server.
+  </Step>
+</Steps>
+
+## Identify Logical File Names
+
+Every SQL Server database backup contains one or more logical file names that map to physical data and log files. You **must** retrieve the exact logical names from the backup itself — do not guess or copy them from another database.
+
+<Steps>
+  <Step title="Run RESTORE FILELISTONLY">
+    ```sql
+    RESTORE FILELISTONLY
+      FROM DISK = N'/var/opt/mssql/backup/incoming/<MIS_DATABASE>.bak';
+    GO
+    ```
+
+    The result set contains a `LogicalName` column and a `Type` column (`D` for data, `L` for log). Record the exact string from `LogicalName` for each row — you will use these in the next step.
+
+    <Warning>
+      The logical names are case-sensitive in the `RESTORE DATABASE` statement. Copy them exactly as shown in the `FILELISTONLY` output. A mismatch will cause the restore to fail.
+    </Warning>
+  </Step>
+</Steps>
+
+## Restore the Production Database
+
+With the logical file names confirmed, you can now run the full restore. The `MOVE` clause redirects the data and log files to the standard SQL Server data directory on the new host.
+
+<Steps>
+  <Step title="Run RESTORE DATABASE">
+    Replace `<MIS_DATABASE>`, `<LOGICAL_DATA_NAME>`, and `<LOGICAL_LOG_NAME>` with the exact values you recorded from `FILELISTONLY`:
+
+    ```sql
+    RESTORE DATABASE [<MIS_DATABASE>]
+      FROM DISK = N'/var/opt/mssql/backup/incoming/<MIS_DATABASE>.bak'
+      WITH
+        MOVE N'<LOGICAL_DATA_NAME>'
+          TO N'/var/opt/mssql/data/<MIS_DATABASE>.mdf',
+        MOVE N'<LOGICAL_LOG_NAME>'
+          TO N'/var/opt/mssql/data/<MIS_DATABASE>_log.ldf',
+        RECOVERY,
+        STATS = 10;
+    GO
+    ```
+
+    <Note>
+      `STATS = 10` prints a progress message every 10% of the restore. For large databases this is the only feedback you will see — do not interrupt the session if it appears to hang between progress lines.
+    </Note>
+  </Step>
+
+  <Step title="Verify the database is ONLINE">
+    ```sql
+    SELECT name, state_desc, recovery_model_desc
+    FROM sys.databases
+    WHERE name = '<MIS_DATABASE>';
+    GO
+    ```
+
+    **PASS:** `state_desc` = `ONLINE`. If the database shows `RESTORING` or `RECOVERY_PENDING`, the restore did not complete cleanly — review the SQL Server error log at `/var/opt/mssql/log/errorlog`.
+  </Step>
+
+  <Step title="Verify tables and row counts">
+    Switch to the restored database and spot-check key tables to confirm data is present:
+
+    ```sql
+    USE [<MIS_DATABASE>];
+    GO
+
+    -- List all user tables and their row counts.
+    SELECT
+      t.name                          AS table_name,
+      p.rows                          AS row_count
+    FROM sys.tables t
+    JOIN sys.partitions p
+      ON t.object_id = p.object_id
+      AND p.index_id IN (0, 1)
+    ORDER BY row_count DESC;
+    GO
+    ```
+
+    Compare key table row counts against the source server. Significant discrepancies indicate an incomplete or stale backup.
+  </Step>
+
+  <Step title="Start the MIS application and run acceptance tests">
+    Update the MIS client configuration to point to the new server and database, then start the application. Run your standard acceptance test suite before decommissioning the old server.
+
+    <Warning>
+      Do not shut down or decommission the old SQL Server until the MIS application team formally signs off on the new instance. Keep the old server running and accessible as a rollback path.
+    </Warning>
+  </Step>
+</Steps>
+
+## Create a Dedicated Backup Automation Login
+
+Automated backup scripts must never use the `sa` account. Create a dedicated login with only the permissions required to perform backups.
+
+<Steps>
+  <Step title="Create the server-level login">
+    Replace `<backup_login>` and `<strong-secret>` with your chosen login name and a strong generated password:
+
+    ```sql
+    -- Run this as sa or a sysadmin login.
+    CREATE LOGIN [<backup_login>]
+      WITH PASSWORD    = N'<strong-secret>',
+           CHECK_POLICY = ON;
+    GO
+    ```
+
+    <Warning>
+      Store the `<strong-secret>` in a secrets manager or encrypted credential store. Do **not** leave it in any script file, cron job, or shell history.
+    </Warning>
+  </Step>
+
+  <Step title="Create a database user and assign the backup role">
+    ```sql
+    USE [<MIS_DATABASE>];
+    CREATE USER [<backup_login>] FOR LOGIN [<backup_login>];
+    ALTER ROLE db_backupoperator ADD MEMBER [<backup_login>];
+    GO
+    ```
+  </Step>
+
+  <Step title="Grant permission to restore databases">
+    This server-level permission allows the login to issue `RESTORE DATABASE` statements when a restore is needed:
+
+    ```sql
+    USE [master];
+    GRANT CREATE ANY DATABASE TO [<backup_login>];
+    GO
+    ```
+  </Step>
+</Steps>
+
+<Tip>
+  Use this backup login in any scheduled `sqlcmd` scripts or third-party backup tools. Pass the password via an environment variable or a credential file protected with `chmod 600` — never as a plain command-line argument that would appear in process listings.
+</Tip>
+
+## Post-Migration Summary
+
+<CardGroup cols={2}>
+  <Card title="Restore verified" icon="circle-check">
+    Database is `ONLINE`, tables and row counts match the source.
+  </Card>
+  <Card title="Application tested" icon="flask">
+    MIS application connects successfully and acceptance tests pass.
+  </Card>
+  <Card title="Backup login created" icon="key">
+    Dedicated backup login in place; `sa` removed from all scripts.
+  </Card>
+  <Card title="Old server retained" icon="server">
+    Source server remains intact until formal sign-off from the MIS team.
+  </Card>
+</CardGroup>

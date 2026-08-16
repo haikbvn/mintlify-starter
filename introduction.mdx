@@ -1,0 +1,87 @@
+---
+title: "MIS Production Server Runbook Introduction"
+sidebarTitle: "Introduction"
+description: "Learn what this runbook covers, the guiding principles behind the MIS server design, and how to navigate each section safely and effectively."
+---
+
+This runbook documents the end-to-end setup, operation, and maintenance of the MIS Production Server — a physical Ubuntu Server 24.04 LTS machine that hosts SQL Server 2025 Express for approximately three Windows MIS clients. It is the authoritative reference for every administrator who provisions, troubleshoots, or hands off this system.
+
+## What This Runbook Covers
+
+<CardGroup cols={2}>
+  <Card title="Hardware & OS" icon="server">
+    Physical server requirements, BIOS settings, Ubuntu installation, and first-boot verification.
+  </Card>
+  <Card title="Networking" icon="network-wired">
+    Static IP assignment with Netplan, LAN connectivity, and Tailscale overlay network setup.
+  </Card>
+  <Card title="Security" icon="shield-halved">
+    SSH key hardening, UFW firewall rules, and the principle of least-privilege access.
+  </Card>
+  <Card title="SQL Server" icon="database">
+    Installing SQL Server 2025 Express natively, configuring the MIS database, and tuning memory.
+  </Card>
+  <Card title="Backups" icon="floppy-disk">
+    Automated local staging backups, NAS offload, retention policy, and restore verification.
+  </Card>
+  <Card title="Monitoring" icon="chart-line">
+    systemd service health, disk SMART status, UPS monitoring, and alerting.
+  </Card>
+</CardGroup>
+
+## System Overview
+
+The MIS server is a dedicated, always-on physical machine. Windows MIS clients reach SQL Server over TCP port 1433 either directly on the LAN or through the Tailscale encrypted overlay network. Administrators access the server shell exclusively via Tailscale SSH — port 22 is never exposed to the public internet.
+
+| Property | Value |
+|---|---|
+| Hostname | `mis-server` |
+| OS | Ubuntu Server 24.04 LTS |
+| Database | SQL Server 2025 Express |
+| Client count | ~3 Windows MIS clients |
+| Connectivity | LAN + Tailscale VPN |
+| RPO | ≤ 24 hours |
+| RTO | ≤ 4 hours |
+
+## Core Principles
+
+These principles are non-negotiable. Every procedure in this runbook is designed around them.
+
+<Warning>
+**SQL Server must never be port-forwarded to the internet.** TCP 1433 must only be reachable from trusted LAN CIDRs or the Tailscale interface. Any router configuration that exposes port 1433 publicly is a critical security incident.
+</Warning>
+
+<Warning>
+**Never disable the firewall to diagnose a connection problem.** If a client cannot connect, work through the layers — check the application, then the service, then UFW rules, then the network. Disabling UFW is never an acceptable diagnostic step in production.
+</Warning>
+
+<Note>
+**`VERIFYONLY` does not replace a restore test.** Running `RESTORE VERIFYONLY` confirms that a backup file is readable; it does not prove that you can recover the database. Schedule regular full restore tests to a staging instance.
+</Note>
+
+<Note>
+**Backups require at least two independent copies.** Local staging on the OS disk counts as one copy. The NAS copy counts as the second. Both must be current before a backup cycle is considered complete.
+</Note>
+
+<Tip>
+**Never copy hostnames, IP addresses, database names, or credentials from sample configuration snippets blindly.** Every configuration file in this runbook contains placeholder values. Substitute your actual network values before you apply anything.
+</Tip>
+
+## Recovery Objectives
+
+| Objective | Target |
+|---|---|
+| Recovery Point Objective (RPO) | ≤ 24 hours |
+| Recovery Time Objective (RTO) | ≤ 4 hours |
+| Local backup retention | 14 days |
+| NAS daily retention | 14 days |
+| NAS weekly retention | 8 weeks |
+| NAS monthly retention | 12 months |
+
+## How to Use This Runbook
+
+Read the [Architecture](/architecture) page first to understand how all components relate to each other. Then follow the Setup section in order — hardware, OS installation, networking, SSH hardening, and firewall — before moving on to SQL Server installation and backup configuration. Each page assumes the previous steps are complete.
+
+<Tip>
+If you are responding to an incident rather than doing a fresh build, jump directly to the relevant operational section. Each page is self-contained enough to be used in isolation during an outage.
+</Tip>

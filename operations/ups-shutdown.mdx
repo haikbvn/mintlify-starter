@@ -1,0 +1,226 @@
+---
+title: "UPS Graceful Shutdown with NUT for MIS Server"
+sidebarTitle: "UPS Shutdown"
+description: "Install and configure Network UPS Tools so your MIS server shuts down cleanly on battery threshold, protecting SQL Server data during a power outage."
+---
+
+A sudden power loss without a graceful shutdown is one of the most reliable ways to corrupt a SQL Server database. Your goal is a fully automated chain: power fails → UPS switches to battery → NUT detects a low-battery threshold → the OS shuts down cleanly → SQL Server flushes its buffers → the server powers off safely. This page shows you how to build and verify that chain using Network UPS Tools (NUT).
+
+<Warning>
+  The driver name, model string, and port you configure in `ups.conf` **must match your actual UPS hardware exactly**. Using a wrong driver can prevent NUT from communicating with the UPS at all. Run `nut-scanner` to discover the correct values for your device — do not guess or copy values from an unrelated example.
+</Warning>
+
+## How the Shutdown Chain Works
+
+```
+AC power loss
+  └─► UPS switches to battery
+        └─► NUT upsmon monitors battery level
+              └─► Battery reaches LOWBATT threshold
+                    └─► upsmon triggers system shutdown
+                          └─► systemd stops all services (including mssql-server)
+                                └─► SQL Server flushes buffers and exits cleanly
+                                      └─► Kernel halts; UPS cuts power
+```
+
+When AC power returns, your server restarts automatically if you enable the BIOS power-restore option covered at the end of this page.
+
+## Install NUT
+
+<Steps>
+  <Step title="Install the NUT package">
+    ```bash
+    sudo apt install -y nut
+    ```
+  </Step>
+
+  <Step title="Identify your UPS device">
+    Plug in the UPS USB cable and confirm the OS sees it:
+
+    ```bash
+    lsusb
+    ```
+
+    Then let NUT scan for compatible UPS hardware automatically:
+
+    ```bash
+    sudo nut-scanner -U
+    ```
+
+    The scanner prints a ready-to-use `ups.conf` block with the correct `driver`, `port`, and `desc` values for your device. Copy those values — you will use them in the next step.
+  </Step>
+</Steps>
+
+<Note>
+  `nut-scanner -U` only scans USB-connected UPS devices. If your UPS uses a serial or network connection, use the `-s` or `-n` flags respectively. Run `nut-scanner --help` for all options.
+</Note>
+
+## Configure NUT
+
+<Steps>
+  <Step title="Define the UPS driver in ups.conf">
+    Open the file for editing:
+
+    ```bash
+    sudoedit /etc/nut/ups.conf
+    ```
+
+    Add a stanza using the exact values reported by `nut-scanner`. The example below shows the structure — replace every value with what your scanner reported:
+
+    ```ini
+    [myups]
+      driver = usbhid-ups
+      port   = auto
+      desc   = "Office UPS"
+    ```
+
+    <Warning>
+      The section name in brackets (`[myups]`) becomes the UPS name you reference in all other NUT configuration files. Choose a short, lowercase name with no spaces.
+    </Warning>
+  </Step>
+
+  <Step title="Configure upsmon">
+    Open the monitor configuration:
+
+    ```bash
+    sudoedit /etc/nut/upsmon.conf
+    ```
+
+    Add a `MONITOR` line that references the UPS name you defined above. For a standalone server that is both the UPS host and the machine that shuts down, use `master` mode:
+
+    ```ini
+    MONITOR myups@localhost 1 local monmaster
+    MINSUPPLIES 1
+    SHUTDOWNCMD "/sbin/shutdown -h +0"
+    NOTIFYCMD /usr/sbin/upssched
+    DEADTIME 15
+    POWERDOWNFLAG /etc/killpower
+    POLLFREQ 5
+    POLLFREQALERT 5
+    HOSTSYNC 15
+    ```
+
+    Replace `myups` with the name you chose in `ups.conf`.
+  </Step>
+
+  <Step title="Set NUT to standalone mode">
+    Open the main NUT configuration:
+
+    ```bash
+    sudoedit /etc/nut/nut.conf
+    ```
+
+    Set the mode to `standalone` for a single server managing its own UPS:
+
+    ```ini
+    MODE=standalone
+    ```
+  </Step>
+
+  <Step title="Enable and start the NUT services">
+    ```bash
+    sudo systemctl enable --now nut-driver nut-monitor
+    ```
+  </Step>
+
+  <Step title="Verify NUT is reading UPS data">
+    Query all available UPS variables:
+
+    ```bash
+    sudo upsc myups@localhost
+    ```
+
+    You should see output including battery charge, estimated runtime, and input/output voltage. A successful read confirms the driver is communicating with the UPS hardware.
+
+    Check both service statuses:
+
+    ```bash
+    sudo systemctl status nut-driver nut-monitor --no-pager
+    ```
+
+    Both should show `active (running)`.
+  </Step>
+</Steps>
+
+## Test the Shutdown Chain
+
+<Warning>
+  Perform this test during a scheduled maintenance window with no active MIS users. The server will shut down completely. Coordinate with all stakeholders before you pull the power.
+</Warning>
+
+<Steps>
+  <Step title="Confirm a recent backup exists">
+    Before testing, verify that a current backup exists and has been verified. A hardware or configuration issue during testing is rare, but possible.
+  </Step>
+
+  <Step title="Simulate power loss">
+    Unplug the UPS from the wall outlet (do not power off the UPS directly — you want to simulate AC loss, not a UPS failure). The UPS should switch to battery and NUT should detect the transition.
+
+    Watch the log in real time to observe the shutdown sequence:
+
+    ```bash
+    journalctl -fu nut-monitor
+    ```
+  </Step>
+
+  <Step title="Confirm graceful shutdown">
+    The server should proceed through a clean shutdown:
+
+    - systemd stops `mssql-server` (SQL Server flushes all dirty pages)
+    - All other services stop in dependency order
+    - The kernel halts and sends the UPS the powerdown signal
+    - The UPS cuts DC output
+
+    If the server powers off cleanly, the test passes.
+  </Step>
+
+  <Step title="Restore AC power and verify boot">
+    Reconnect the UPS to AC power. If your BIOS is configured for power restore (see below), the server boots automatically. Once it is back up, run your standard post-reboot checks:
+
+    ```bash
+    systemctl is-active mssql-server
+    systemctl is-active nut-driver
+    systemctl is-active nut-monitor
+    ```
+  </Step>
+</Steps>
+
+## UPS Readiness Checklist
+
+Before you consider UPS protection complete, confirm all of the following:
+
+<AccordionGroup>
+  <Accordion title="UPS recognized by the OS">
+    `lsusb` shows the UPS device, and `nut-scanner -U` returns a valid driver block. NUT is not guessing at hardware compatibility.
+  </Accordion>
+
+  <Accordion title="NUT reads battery status">
+    `sudo upsc myups@localhost` returns battery charge, estimated runtime, and voltage values. No connection errors or timeouts appear.
+  </Accordion>
+
+  <Accordion title="Simulated power loss tested">
+    You have unplugged the UPS from AC and confirmed that `nut-monitor` detects the battery event and initiates a shutdown before you re-plugged it. Document the test date and result.
+  </Accordion>
+
+  <Accordion title="Graceful shutdown verified">
+    SQL Server stopped cleanly (no crash recovery on next boot), and the filesystem was not left in a dirty state. Check `journalctl -b -1 -u mssql-server` after rebooting to confirm clean exit.
+  </Accordion>
+
+  <Accordion title="Auto-boot on AC restore confirmed">
+    The server booted automatically after AC power returned. If it did not, enable the setting in the next section.
+  </Accordion>
+</AccordionGroup>
+
+## Enable Auto-Boot After Power Restore
+
+If your server does not boot automatically when AC power returns after an outage, enable the relevant BIOS/UEFI option. The setting is usually called one of:
+
+- **Restore on AC/Power Loss** → set to `Power On`
+- **After Power Failure** → set to `Last State` or `Always On`
+- **AC Recovery** → set to `On`
+
+The exact path varies by motherboard manufacturer. Enter your BIOS/UEFI setup (typically `Del` or `F2` at POST), locate the power management section, and enable the option.
+
+<Note>
+  Without this setting, every power outage requires someone to physically press the power button to restart the server — defeating much of the value of the UPS graceful shutdown configuration.
+</Note>

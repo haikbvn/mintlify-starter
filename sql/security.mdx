@@ -1,0 +1,169 @@
+---
+title: "Harden SQL Server 2025 Express for MIS Production Use"
+sidebarTitle: "Security"
+description: "Apply password policies, lock down the sa account, create least-privilege logins, and monitor Express edition limits to protect your MIS database."
+---
+
+Securing your SQL Server instance is not optional — it is a prerequisite to running any MIS workload. This page covers the controls you must apply immediately after installation: password hygiene, account management, network configuration review, and Express edition capacity limits that can affect production availability if left unmonitored.
+
+## Password Policy
+
+SQL Server enforces Windows-style password complexity rules even on Linux. Every SQL login password **must** satisfy at least three of the following four character-class requirements:
+
+<CardGroup cols={2}>
+  <Card title="Uppercase letters" icon="arrow-up">
+    At least one uppercase Latin letter (A–Z)
+  </Card>
+  <Card title="Lowercase letters" icon="arrow-down">
+    At least one lowercase Latin letter (a–z)
+  </Card>
+  <Card title="Digits" icon="hashtag">
+    At least one numeric digit (0–9)
+  </Card>
+  <Card title="Symbols" icon="star">
+    At least one non-alphanumeric symbol (e.g. `!`, `@`, `#`, `$`)
+  </Card>
+</CardGroup>
+
+<Warning>
+  **Never** store SQL passwords in plain text — not in HTML pages, shell scripts, `.env` files, Git repositories, systemd unit files, or cron jobs. Use a secrets manager or an encrypted credential store. If a password is ever committed to a repository, rotate it immediately.
+</Warning>
+
+<Tip>
+  Use a password manager to generate a long random password (20+ characters). The longer the password, the more resilient it is against brute-force attacks, even if it only satisfies the minimum complexity requirement.
+</Tip>
+
+## The `sa` Account
+
+The built-in `sa` (System Administrator) login has unrestricted access to every database and server resource. You set its password during `mssql-conf setup`, and it is the only account available at that moment — but it must not remain the primary account for ongoing operations.
+
+<Warning>
+  Use `sa` **only** for the initial administrative bootstrap (creating other logins, restoring databases). Do not use `sa` in application connection strings, automated scripts, or scheduled tasks.
+</Warning>
+
+The correct pattern is:
+
+1. Use `sa` to create a dedicated, least-privilege SQL login for MIS (see below).
+2. Use `sa` to create a dedicated backup automation login (see [Migration & Restore](/sql/migration)).
+3. Use only those least-privilege logins for all ongoing operations.
+
+## Create a Dedicated MIS Application Login
+
+If your MIS application supports SQL Server authentication, create a dedicated login and grant it only the permissions MIS requires. Do not grant more than necessary.
+
+<Warning>
+  Do **not** change the SQL Server authentication mode or alter database-level permissions without first confirming what your specific MIS version requires. Incorrect permission changes can break the application or open unintended access.
+</Warning>
+
+The following is a template — replace `<mis_login>`, `<strong-secret>`, and `<MIS_DATABASE>` with your actual values before running:
+
+```sql
+-- Connect as sa or a sysadmin login before running this block.
+
+-- 1. Create the server-level login.
+CREATE LOGIN [<mis_login>]
+  WITH PASSWORD   = N'<strong-secret>',
+       CHECK_POLICY = ON;   -- enforces the complexity policy above
+GO
+
+-- 2. Switch to the target database and create a mapped user.
+USE [<MIS_DATABASE>];
+CREATE USER [<mis_login>] FOR LOGIN [<mis_login>];
+GO
+
+-- 3. Grant the minimum role(s) required by MIS.
+--    Adjust db_datareader / db_datawriter / custom roles to match MIS requirements.
+ALTER ROLE db_datareader ADD MEMBER [<mis_login>];
+ALTER ROLE db_datawriter ADD MEMBER [<mis_login>];
+GO
+```
+
+<Note>
+  `CHECK_POLICY = ON` links the login to the SQL Server password complexity and lockout policy. Always include it when creating new logins.
+</Note>
+
+## Review Network and Encryption Configuration
+
+After installation, audit the key network settings to make sure nothing unexpected was applied:
+
+```bash
+sudo /opt/mssql/bin/mssql-conf get network.tcpport
+sudo /opt/mssql/bin/mssql-conf get network.forceencryption
+sudo /opt/mssql/bin/mssql-conf list
+```
+
+| Setting | Expected value | Notes |
+|---|---|---|
+| `network.tcpport` | `1433` (default) | If changed, update firewall rules and all client configs. |
+| `network.forceencryption` | `1` (recommended) | Forces TLS for all client connections. |
+
+<Tip>
+  If `network.forceencryption` is `0`, client connections may transmit credentials in cleartext. Enable it with `sudo /opt/mssql/bin/mssql-conf set network.forceencryption 1` and restart the service: `sudo systemctl restart mssql-server`.
+</Tip>
+
+### Firewall Rules
+
+Only open port 1433 (or your custom port) to the hosts that genuinely require access — typically the MIS application server. Block all other inbound access.
+
+```bash
+# Allow MIS application server — replace <MIS_APP_SERVER_IP> with the actual address.
+sudo ufw allow from <MIS_APP_SERVER_IP> to any port 1433 proto tcp
+
+# Deny all other inbound connections to port 1433.
+sudo ufw deny 1433/tcp
+
+sudo ufw status verbose
+```
+
+<Warning>
+  Do not expose port 1433 to the public internet. If remote DBA access is needed, use a VPN or SSH tunnel instead of opening the port directly.
+</Warning>
+
+## Monitor SQL Server Express Edition Limits
+
+SQL Server Express has hard resource limits that cannot be changed by configuration. Breaching these limits causes query failures and application errors — you must monitor them proactively.
+
+<CardGroup cols={3}>
+  <Card title="CPU Cores" icon="microchip">
+    Express uses a maximum of **4 cores**, regardless of how many the host has.
+  </Card>
+  <Card title="Buffer Pool Memory" icon="database">
+    The buffer pool is capped at approximately **1,410 MB**. Memory pressure will increase disk I/O.
+  </Card>
+  <Card title="Database Size" icon="hard-drive">
+    Each user database is limited to **10 GB** of data files. Log files are not counted against this limit.
+  </Card>
+</CardGroup>
+
+<Warning>
+  The 10 GB data file limit per database is a hard ceiling for SQL Server Express. If your MIS database approaches this limit, queries will begin to fail with a capacity error. Plan to monitor growth regularly and engage your vendor or DBA before you approach the limit.
+</Warning>
+
+Run the following query to check current database sizes at any time:
+
+```sql
+SELECT
+  DB_NAME(database_id)       AS database_name,
+  SUM(size) * 8.0 / 1024     AS size_mb
+FROM sys.master_files
+GROUP BY database_id
+ORDER BY size_mb DESC;
+GO
+```
+
+<Tip>
+  Schedule this query as a SQL Server Agent job or a cron-driven `sqlcmd` script to alert you when any database exceeds 8 GB — giving you time to act before hitting the 10 GB ceiling.
+</Tip>
+
+## Security Checklist
+
+Use this checklist to confirm you have applied all required controls before connecting MIS to the database:
+
+- [ ] `sa` password is long, random, and stored only in a password manager
+- [ ] `sa` is not used in any application connection string or automated script
+- [ ] A dedicated least-privilege SQL login exists for the MIS application
+- [ ] `CHECK_POLICY = ON` is set on all SQL logins
+- [ ] `network.forceencryption` is set to `1`
+- [ ] Firewall allows port 1433 only from the MIS application server
+- [ ] No passwords appear in any script, config file, or Git commit
+- [ ] Database size monitoring is in place

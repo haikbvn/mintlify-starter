@@ -1,0 +1,188 @@
+---
+title: "SQL Server 2025 Express Installation on Ubuntu 24.04"
+sidebarTitle: "Installation"
+description: "Step-by-step guide to installing and verifying SQL Server 2025 Express on Ubuntu 24.04, covering the Microsoft repo, mssql-conf setup, and sqlcmd tools."
+---
+
+This guide walks you through installing Microsoft SQL Server 2025 Express on Ubuntu 24.04 from the official Microsoft package repository. By the end you will have a running, enabled SQL Server instance with the `sqlcmd` command-line tools installed and a verified local connection.
+
+<Warning>
+  SQL Server 2025 Express on Ubuntu 24.04 requires **Cumulative Update 1 (CU1)** or later. Always install the latest available GA or CU release from the official Microsoft repository — do not pin to an older package version.
+</Warning>
+
+## Add the Microsoft Package Repository
+
+Before installing the SQL Server engine, you must register the Microsoft APT repository and import its signing key.
+
+<Steps>
+  <Step title="Import the Microsoft signing key">
+    Download and store the GPG key used to verify Microsoft packages:
+
+    ```bash
+    curl -fsSL https://packages.microsoft.com/keys/microsoft.asc \
+      | sudo gpg --dearmor -o /usr/share/keyrings/microsoft-prod.gpg
+    ```
+  </Step>
+
+  <Step title="Add the Ubuntu 24.04 package list">
+    Register the Microsoft production repository for Ubuntu 24.04:
+
+    ```bash
+    curl -fsSL https://packages.microsoft.com/config/ubuntu/24.04/prod.list \
+      | sudo tee /etc/apt/sources.list.d/microsoft-prod.list >/dev/null
+    ```
+  </Step>
+
+  <Step title="Refresh the package index">
+    ```bash
+    sudo apt update
+    ```
+  </Step>
+</Steps>
+
+## Install and Configure the SQL Server Engine
+
+<Steps>
+  <Step title="Install the mssql-server package">
+    The `ACCEPT_EULA` environment variable is required to confirm acceptance of the Microsoft End User License Agreement:
+
+    ```bash
+    sudo ACCEPT_EULA=Y apt install -y mssql-server
+    ```
+  </Step>
+
+  <Step title="Run the configuration wizard">
+    ```bash
+    sudo /opt/mssql/bin/mssql-conf setup
+    ```
+
+    When prompted by the wizard:
+
+    - **Edition** — select **Express**.
+    - **SA password** — enter a strong password that meets the SQL Server complexity policy (see [Security](/sql/security) for requirements). Record it securely in your password manager — do **not** write it in any script, file, or Git repository.
+
+    <Note>
+      Note the edition and version string that the wizard prints on completion. You will need this to confirm a successful installation in the verification step below.
+    </Note>
+  </Step>
+
+  <Step title="Enable and start the service">
+    Enable the service to start at boot and start it immediately:
+
+    ```bash
+    sudo systemctl enable --now mssql-server
+    ```
+  </Step>
+
+  <Step title="Confirm the service is running">
+    ```bash
+    sudo systemctl status mssql-server --no-pager
+    systemctl is-enabled mssql-server
+    ```
+
+    **PASS criteria:**
+    - `systemctl status` reports **`active (running)`**
+    - `is-enabled` returns **`enabled`**
+
+    If the service fails to start, check the SQL Server error log at `/var/opt/mssql/log/errorlog` for details.
+  </Step>
+</Steps>
+
+## Verify the Listening Port
+
+SQL Server listens on TCP port **1433** by default. Confirm this before proceeding.
+
+<Steps>
+  <Step title="Check the listening socket">
+    ```bash
+    sudo ss -lntp | grep 1433
+    ```
+
+    You should see a line with `0.0.0.0:1433` or `*:1433` in the output.
+  </Step>
+
+  <Step title="Confirm the configured port">
+    ```bash
+    sudo /opt/mssql/bin/mssql-conf get network.tcpport
+    ```
+
+    <Warning>
+      If the port has been changed from the default `1433`, you must update both your firewall rules and your MIS client configuration to match before proceeding. Refer to the [Security](/sql/security) page for firewall guidance.
+    </Warning>
+  </Step>
+</Steps>
+
+## Install the sqlcmd Command-Line Tools
+
+The `mssql-tools18` package provides the `sqlcmd` and `bcp` utilities needed to connect to and manage the server from the command line.
+
+<Steps>
+  <Step title="Install mssql-tools18 and the ODBC driver">
+    ```bash
+    sudo ACCEPT_EULA=Y apt install -y mssql-tools18 unixodbc-dev
+    ```
+  </Step>
+
+  <Step title="Add the tools directory to your PATH">
+    ```bash
+    echo 'export PATH="$PATH:/opt/mssql-tools18/bin"' >> ~/.bashrc && source ~/.bashrc
+    ```
+
+    <Tip>
+      If you need `sqlcmd` available system-wide (for example, in cron jobs or service accounts), add the export line to `/etc/environment` or a file in `/etc/profile.d/` instead of your personal `~/.bashrc`.
+    </Tip>
+  </Step>
+</Steps>
+
+## Verify the Installation
+
+Connect to the local instance and run a set of diagnostic queries to confirm the engine is running correctly.
+
+<Steps>
+  <Step title="Open a local sqlcmd session">
+    The `-C` flag trusts the server certificate, which is required for self-signed certificates used in new installs:
+
+    ```bash
+    /opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -C
+    ```
+
+    Enter the `sa` password you set during `mssql-conf setup` when prompted.
+  </Step>
+
+  <Step title="Confirm the server version and edition">
+    ```sql
+    SELECT @@VERSION AS sql_version, SERVERPROPERTY('Edition') AS edition;
+    GO
+    ```
+
+    **PASS:** The output contains `SQL Server 2025` and `Express Edition`.
+  </Step>
+
+  <Step title="List all system databases">
+    ```sql
+    SELECT name, state_desc, recovery_model_desc
+    FROM sys.databases;
+    GO
+    ```
+
+    You should see the four system databases (`master`, `tempdb`, `model`, `msdb`) all in `ONLINE` state.
+  </Step>
+
+  <Step title="Inspect database file locations">
+    ```sql
+    SELECT
+      DB_NAME(database_id) AS database_name,
+      type_desc,
+      physical_name
+    FROM sys.master_files
+    ORDER BY database_name, file_id;
+    GO
+    ```
+
+    Confirm all data and log files reside under `/var/opt/mssql/data/`.
+  </Step>
+</Steps>
+
+<Note>
+  Installation is complete. Your next steps are to harden the instance following the [Security](/sql/security) guide before you restore or create any production databases.
+</Note>

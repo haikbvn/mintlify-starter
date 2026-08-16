@@ -1,0 +1,256 @@
+---
+title: "Configuring UFW Firewall Rules for the MIS Server"
+sidebarTitle: "Firewall"
+description: "Apply deny-by-default UFW rules that restrict SSH and SQL Server access to trusted LAN CIDRs and the Tailscale interface, keeping port 1433 off the internet."
+---
+
+UFW (Uncomplicated Firewall) is the host-based firewall you use to enforce the MIS server's network security policy. The default rule is simple: deny all inbound traffic, allow all outbound. You then carve out the minimum set of inbound exceptions needed for MIS clients and administrator access. Nothing else gets in.
+
+This page sets up UFW rules for SSH (port 22) and SQL Server (port 1433). Read through the entire page before running any commands — the order of operations matters, and some rules (Tailscale interface rules) must be added only after Tailscale is installed.
+
+## Firewall Strategy
+
+The MIS server's firewall enforces two key policies:
+
+1. **SQL Server (TCP 1433) is never reachable from the internet.** Access is limited to specific LAN CIDRs and the Tailscale interface.
+2. **SSH (TCP 22) is only reachable from a management LAN CIDR or via Tailscale.** It is not open to all of the LAN, and certainly not the internet.
+
+<Warning>
+Never run `sudo ufw allow 1433/tcp` or `sudo ufw allow 22/tcp` without a source restriction. These commands open the port to every IP address on every interface, including the internet. Always specify either a source CIDR (`from <cidr>`) or a specific interface (`in on tailscale0`).
+</Warning>
+
+<Warning>
+Your router must **not** have port-forwarding rules for TCP 1433 or TCP 22 pointing at this server. UFW protects the server at the OS level, but a router port-forward bypasses the firewall by routing internet traffic directly to the server's open LAN port. Check your router's NAT/port-forwarding table and remove any such rules.
+</Warning>
+
+## Before You Begin
+
+Gather the following values from your network:
+
+| Value | Description | Example |
+|---|---|---|
+| `<management-lan-cidr>` | CIDR of the subnet your admin workstation is on | `192.168.1.0/24` |
+| `<allowed-lan-cidr>` | CIDR of the subnet your MIS client PCs are on (may be the same) | `192.168.1.0/24` |
+
+If your admin workstation and MIS clients are on the same VLAN, both CIDRs will be identical. If they are on separate VLANs, use different values.
+
+<Note>
+Using a /24 CIDR (for example `192.168.1.0/24`) permits all 254 usable addresses on that subnet. If you want tighter control, specify only the exact client IPs (for example `192.168.1.50/32` for a single machine). Prefer the narrower rule in high-security environments.
+</Note>
+
+## Configure UFW Rules
+
+<Steps>
+  <Step title="Set Default Policies">
+    Establish the deny-by-default inbound posture and allow-by-default outbound posture:
+
+    ```bash
+    sudo ufw default deny incoming
+    sudo ufw default allow outgoing
+    ```
+
+    These commands do not activate UFW yet — they only set the default policy for when UFW is enabled.
+  </Step>
+
+  <Step title="Allow SSH from the Management LAN">
+    Permit SSH only from your management subnet. Replace `<management-lan-cidr>` with your actual CIDR:
+
+    ```bash
+    sudo ufw allow from <management-lan-cidr> to any port 22 proto tcp
+    ```
+
+    Example:
+    ```bash
+    sudo ufw allow from 192.168.1.0/24 to any port 22 proto tcp
+    ```
+  </Step>
+
+  <Step title="Allow SQL Server from the Client LAN">
+    Permit TCP 1433 only from the subnet your MIS clients are on. Replace `<allowed-lan-cidr>` with your actual CIDR:
+
+    ```bash
+    sudo ufw allow from <allowed-lan-cidr> to any port 1433 proto tcp
+    ```
+
+    Example:
+    ```bash
+    sudo ufw allow from 192.168.1.0/24 to any port 1433 proto tcp
+    ```
+  </Step>
+
+  <Step title="Enable UFW">
+    Enable the firewall. You will be warned that this may disrupt existing SSH connections. Because you added an SSH rule in Step 2, your current session should remain connected:
+
+    ```bash
+    sudo ufw enable
+    ```
+
+    Type `y` when prompted.
+
+    <Warning>
+    If you skipped Step 2 and your SSH session is from within the LAN CIDR you haven't yet added, enabling UFW will drop your connection. Add the SSH rule **before** enabling the firewall.
+    </Warning>
+  </Step>
+
+  <Step title="Verify Active Rules">
+    Confirm the rules are loaded and match what you intended:
+
+    ```bash
+    sudo ufw status numbered
+    sudo ufw status verbose
+    ```
+
+    Expected output from `ufw status numbered` (example with 192.168.1.0/24):
+
+    ```
+    Status: active
+
+         To                         Action      From
+         --                         ------      ----
+    [ 1] 22/tcp                     ALLOW IN    192.168.1.0/24
+    [ 2] 1433/tcp                   ALLOW IN    192.168.1.0/24
+    ```
+
+    `ufw status verbose` also shows the default policies:
+
+    ```
+    Default: deny (incoming), allow (outgoing), disabled (routed)
+    ```
+  </Step>
+</Steps>
+
+## Add Tailscale Interface Rules
+
+<Note>
+Add these rules only after you have installed and authenticated Tailscale on the server. The `tailscale0` interface does not exist until Tailscale is running, and UFW rules that reference it are silently ignored if the interface is absent.
+</Note>
+
+Once Tailscale is installed, permit SSH and SQL Server through the Tailscale interface. This allows remote administrator access and remote MIS client connections without opening any ports on your internet-facing router:
+
+```bash
+# SSH via Tailscale (for remote administrator access)
+sudo ufw allow in on tailscale0 to any port 22 proto tcp
+
+# SQL Server via Tailscale (for remote MIS client connections)
+sudo ufw allow in on tailscale0 to any port 1433 proto tcp
+```
+
+Reload and verify:
+
+```bash
+sudo ufw reload
+sudo ufw status numbered
+```
+
+The updated output should include the Tailscale interface rules:
+
+```
+Status: active
+
+     To                         Action      From
+     --                         ------      ----
+[ 1] 22/tcp                     ALLOW IN    192.168.1.0/24
+[ 2] 1433/tcp                   ALLOW IN    192.168.1.0/24
+[ 3] 22/tcp on tailscale0        ALLOW IN    Anywhere
+[ 4] 1433/tcp on tailscale0      ALLOW IN    Anywhere
+```
+
+<Note>
+Rules 3 and 4 show "Anywhere" in the `From` column because they are scoped to the `tailscale0` interface, not to a source IP. Traffic on `tailscale0` is already authenticated and encrypted by Tailscale — only devices in your Tailscale network can reach this interface.
+</Note>
+
+## Managing Rules
+
+### Deleting a Rule
+
+To remove a rule, use its number from `ufw status numbered`:
+
+```bash
+sudo ufw delete <rule-number>
+```
+
+Example — to delete rule 2:
+
+```bash
+sudo ufw delete 2
+```
+
+UFW will ask you to confirm before deleting.
+
+### Reloading After Changes
+
+After adding, modifying, or deleting rules, reload UFW to apply the changes:
+
+```bash
+sudo ufw reload
+```
+
+### Checking UFW Logs
+
+UFW logs blocked connection attempts to the system journal. To review them:
+
+```bash
+sudo journalctl -u ufw --since today --no-pager
+```
+
+Or for the kernel-level log entries:
+
+```bash
+sudo dmesg | grep -i ufw
+```
+
+## Diagnosing Connection Problems
+
+If an MIS client cannot connect to SQL Server, work through the layers in order. Do not disable UFW.
+
+<Steps>
+  <Step title="Check the SQL Server Service">
+    ```bash
+    sudo systemctl status mssql-server --no-pager
+    sudo ss -lntp | grep ':1433'
+    ```
+
+    If port 1433 is not listening, SQL Server is not running — the firewall is not the problem.
+  </Step>
+
+  <Step title="Check UFW Rules">
+    ```bash
+    sudo ufw status numbered
+    ```
+
+    Confirm there is a rule permitting the client's source IP on port 1433. If the client is on `192.168.1.50` and your rule covers `192.168.1.0/24`, the client is within the allowed range.
+  </Step>
+
+  <Step title="Test Port Reachability from the Client">
+    From the Windows MIS client, open PowerShell and test TCP connectivity:
+
+    ```powershell
+    Test-NetConnection -ComputerName 192.168.1.74 -Port 1433
+    ```
+
+    A `TcpTestSucceeded: True` result means UFW is not blocking the connection. The problem is in the SQL Server configuration or connection string.
+  </Step>
+
+  <Step title="Capture UFW Block Events">
+    ```bash
+    sudo tail -f /var/log/ufw.log
+    ```
+
+    If you see `[UFW BLOCK]` entries with the client's IP as the source, UFW is blocking the connection and you need to add or correct a rule.
+  </Step>
+</Steps>
+
+<Warning>
+**Do not run `sudo ufw disable` to fix a connection problem.** This exposes all ports on all interfaces to all traffic and is not a diagnostic technique — it is an outage. If you genuinely need to determine whether UFW is the cause of a problem, add a temporary, specific rule for the source IP and test. Remove the rule immediately after testing.
+</Warning>
+
+## Checklist Before Moving On
+
+- [ ] `sudo ufw default deny incoming` and `allow outgoing` set
+- [ ] SSH rule added with actual management LAN CIDR (not a placeholder)
+- [ ] SQL Server rule added with actual client LAN CIDR (not a placeholder)
+- [ ] `sudo ufw enable` completed without dropping your SSH session
+- [ ] `sudo ufw status numbered` shows only the expected rules
+- [ ] `sudo ufw status verbose` confirms default deny incoming policy
+- [ ] Router has **no** port-forwarding rules for TCP 22 or 1433
+- [ ] (After Tailscale install) Tailscale interface rules added for ports 22 and 1433

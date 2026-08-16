@@ -1,0 +1,175 @@
+---
+title: "NAS Backup Mount, Copy, and Retention Policy"
+sidebarTitle: "NAS Backup"
+description: "Mount a CIFS/SMB NAS share, validate mssql write access, configure off-server backup copies, and apply a tiered daily/weekly/monthly retention policy."
+---
+
+Copying backups to a NAS gives you an off-server recovery point — if the local disk fails or the OS becomes unbootable, you can still restore from the NAS copy. This page covers mounting the share securely, verifying that the `mssql` service account can write to it, and understanding the retention tiers that govern how long each backup set is kept.
+
+<Warning>
+The NAS must **not** be your only backup location. If the NAS device and the production server are in the same physical room, a single theft or fire destroys both copies simultaneously. Treat NAS as a convenience tier, not a disaster-recovery guarantee. See [Restore & Disaster Recovery](/backup/restore-dr) for off-site strategy.
+</Warning>
+
+## Backup Copy Architecture
+
+The backup pipeline enforces a strict ordering: SQL Server writes the `.bak` file locally, `RESTORE VERIFYONLY` passes, and only then does `rsync` copy the verified file to the NAS. You never copy a file that SQL Server is still writing, and you never copy a file that failed verification.
+
+```
+SQL Server → local .bak → VERIFY PASS → rsync → NAS
+```
+
+<Note>
+  This ordering is enforced by the `set -Eeuo pipefail` directive in the backup script. If the `BACKUP` or `VERIFYONLY` command returns a non-zero exit code, the script aborts before reaching the `rsync` line.
+</Note>
+
+## Mount the NAS Share
+
+<Steps>
+  <Step title="Create the mount point">
+    ```bash
+    sudo mkdir -p /mnt/mis-nas
+    ```
+  </Step>
+
+  <Step title="Store NAS credentials securely">
+    ```bash
+    sudoedit /root/.smb-mis-nas-credentials
+    ```
+
+    Add your NAS backup user credentials:
+
+    ```bash
+    username=<nas-backup-user>
+    password=<secret>
+    ```
+
+    Then lock down the file so only root can read it:
+
+    ```bash
+    sudo chmod 600 /root/.smb-mis-nas-credentials
+    ```
+
+    <Warning>
+      Never put NAS credentials directly in `/etc/fstab`. The credentials file must be readable only by `root` (`chmod 600`) and should use a dedicated NAS account that has write access only to the backup share — not an administrator account.
+    </Warning>
+  </Step>
+
+  <Step title="Test the mount manually">
+    Before writing an `fstab` entry, confirm the share mounts correctly by hand:
+
+    ```bash
+    sudo mount -t cifs //<nas-host>/<share> /mnt/mis-nas \
+      -o credentials=/root/.smb-mis-nas-credentials,vers=3.0
+    ```
+
+    If the command returns without error, the share is reachable and your credentials are correct.
+  </Step>
+
+  <Step title="Look up the mssql UID and GID">
+    The `fstab` entry pins the ownership of mounted files to the `mssql` service account so the backup script can write without needing `sudo`:
+
+    ```bash
+    id -u mssql
+    id -g mssql
+    ```
+
+    Note both numbers — you will substitute them into the `fstab` entry below.
+  </Step>
+
+  <Step title="Add a persistent fstab entry">
+    Open `/etc/fstab` and append the following line, replacing the placeholder values with your NAS host, share name, and the UID/GID from the previous step:
+
+    ```
+    //<nas-host>/<share> /mnt/mis-nas cifs \
+      credentials=/root/.smb-mis-nas-credentials,\
+      uid=<mssql_uid>,gid=<mssql_gid>,\
+      file_mode=0640,dir_mode=0750,\
+      vers=3.0,nofail,x-systemd.automount,_netdev 0 0
+    ```
+
+    <Note>
+      The `fstab` entry must be a single unbroken line. The backslash continuations above are for readability only — remove them when you paste into the file.
+    </Note>
+
+    Key mount options explained:
+
+    | Option | Purpose |
+    |---|---|
+    | `nofail` | Boot succeeds even if the NAS is unreachable |
+    | `x-systemd.automount` | Mount on first access rather than at boot time |
+    | `_netdev` | Tells systemd this mount requires the network to be up |
+    | `vers=3.0` | Forces SMB 3.0; avoids negotiation with insecure older versions |
+  </Step>
+
+  <Step title="Apply and verify the new fstab entry">
+    ```bash
+    sudo systemctl daemon-reload
+    sudo mount -a
+    findmnt /mnt/mis-nas
+    ```
+
+    `findmnt` should print a single row showing the CIFS source, the `/mnt/mis-nas` target, and the mount options you specified.
+  </Step>
+
+  <Step title="Verify that mssql can write to the share">
+    ```bash
+    sudo -u mssql sh -c 'touch /mnt/mis-nas/.mssql-write-test && rm /mnt/mis-nas/.mssql-write-test'
+    ```
+
+    If this command exits silently, the `mssql` service account has write permission. If you see a `Permission denied` error, recheck the `uid`, `gid`, `file_mode`, and `dir_mode` options in `fstab`, as well as the share permissions on the NAS itself.
+  </Step>
+</Steps>
+
+## Manual NAS Copy
+
+After the mount is confirmed, you can copy any verified local backup to the NAS by hand:
+
+```bash
+sudo -u mssql rsync -avh --partial --checksum \
+  /var/opt/mssql/backup/local/ \
+  /mnt/mis-nas/mis-server/
+```
+
+<Tip>
+  `--checksum` forces `rsync` to compare file contents rather than relying on timestamps and size alone. This catches any silent corruption that might occur during transfer.
+</Tip>
+
+The automated backup script performs this same copy automatically each night, but only after `RESTORE VERIFYONLY` passes. You do not need to run the manual copy command unless you are testing the mount or recovering from a missed automated run.
+
+## NAS Retention Policy
+
+NAS storage is managed manually or via a scheduled task on the NAS device itself. Apply the following tiered retention schedule to the `mis-server/` directory on the share:
+
+| Tier | Keep |
+|---|---|
+| Daily backups | 14 days |
+| Weekly backups (e.g. every Sunday) | 8 weeks |
+| Monthly backups (e.g. first of month) | 12 months |
+
+<Note>
+  The automated backup script prunes **local** copies older than 14 days, but it does not prune the NAS. Configure NAS-side retention separately — either through a scheduled task on the NAS OS or a second script that runs on the production server and connects to the NAS mount.
+</Note>
+
+## Troubleshooting Common Mount Errors
+
+<AccordionGroup>
+  <Accordion title="mount: wrong fs type or bad option">
+    The `cifs-utils` package is not installed. Install it with:
+
+    ```bash
+    sudo apt install cifs-utils
+    ```
+  </Accordion>
+
+  <Accordion title="mount error(13): Permission denied">
+    The NAS credentials are wrong, or the NAS share ACL does not grant write access to the backup user. Re-check `/root/.smb-mis-nas-credentials` and the share permissions on the NAS.
+  </Accordion>
+
+  <Accordion title="mount error(115): Operation now in progress">
+    The NAS host is unreachable. Verify network connectivity with `ping <nas-host>` and confirm the share name is correct. Because `nofail` is set, the server will still boot successfully while the NAS is offline.
+  </Accordion>
+
+  <Accordion title="mssql write test fails with Permission denied">
+    The `uid` or `gid` in `fstab` does not match the actual `mssql` service account IDs. Re-run `id -u mssql` and `id -g mssql`, update `fstab`, unmount (`sudo umount /mnt/mis-nas`), and remount (`sudo mount -a`).
+  </Accordion>
+</AccordionGroup>

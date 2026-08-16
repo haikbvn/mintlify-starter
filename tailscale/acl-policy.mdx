@@ -1,0 +1,195 @@
+---
+title: "Tailscale ACL Policy for Least-Privilege MIS Access"
+sidebarTitle: "ACL Policy"
+description: "Design and apply a Tailscale ACL that limits MIS clients to TCP 1433 only, restricts Tailscale SSH to admins, and keeps SQL Server off the public internet."
+---
+
+The Tailscale ACL policy is the primary access-control layer for the MIS production server. A well-scoped policy means MIS client machines can reach SQL Server on TCP 1433 but cannot SSH into the server, while admins retain Tailscale SSH access without exposing port 22 to the internet. This page explains the design rationale, walks through each policy block, and provides the complete recommended policy you can paste into the Tailscale admin console.
+
+---
+
+## Design Principles
+
+The policy follows a **least-privilege** model:
+
+- MIS clients reach **only TCP 1433** — no SSH, no other ports.
+- Admin SSH runs **through Tailscale**, not the public internet.
+- **No wildcard rules** (`* → * → *`) exist. If the default permissive rule is present in your tailnet, you must remove it before these restrictions mean anything.
+- SQL Server is **never exposed** to the internet.
+
+<Warning>
+  If your current ACL policy contains a rule with `src: ["*"]`, `dst: ["*"]`, and `ip: ["*"]`, remove it before deploying this policy. That single wildcard rule overrides all specific grants and makes every other restriction meaningless.
+</Warning>
+
+---
+
+## Tag Owners
+
+Tags classify nodes by role. Only tailnet admins can assign tags, which prevents a compromised client from self-promoting to a more privileged role.
+
+```json
+"tagOwners": {
+  "tag:mis-server": ["autogroup:admin"],
+  "tag:mis-client": ["autogroup:admin"]
+}
+```
+
+| Tag | Assigned to | Who can assign |
+|---|---|---|
+| `tag:mis-server` | The Ubuntu SQL Server | `autogroup:admin` only |
+| `tag:mis-client` | All MIS client workstations | `autogroup:admin` only |
+
+<Steps>
+
+  <Step title="Assign tag:mis-server to the Ubuntu server">
+    In the [Tailscale Admin Console](https://login.tailscale.com/admin/machines), find the Ubuntu server under **Machines**. Open its details, click **Edit tags**, and add `tag:mis-server`.
+  </Step>
+
+  <Step title="Assign tag:mis-client to each MIS workstation">
+    Repeat the process for every MIS client machine. You can also set the tag at enrollment time using `tailscale up --advertise-tags=tag:mis-client` on the client. See [Client Onboarding](/tailscale/client-onboarding) for the full workflow.
+  </Step>
+
+</Steps>
+
+---
+
+## Grants
+
+Grants define which source nodes can open network connections to which destination nodes and ports. These rules apply at the Tailscale network layer — before the packet even reaches UFW or the application.
+
+```json
+"grants": [
+  {
+    "src": ["tag:mis-client"],
+    "dst": ["tag:mis-server"],
+    "ip":  ["tcp:1433"]
+  },
+  {
+    "src": ["autogroup:admin"],
+    "dst": ["tag:mis-server"],
+    "ip":  ["tcp:22"]
+  }
+]
+```
+
+<Note>
+  The TCP 1433 grant gives `tag:mis-client` nodes **network reachability** to SQL Server — it does not grant SSH. The TCP 22 grant similarly gives `autogroup:admin` nodes network reachability to port 22, but SSH authentication is still governed by the `ssh` block below. Both layers must be satisfied for an SSH session to succeed.
+</Note>
+
+---
+
+## SSH Authorization
+
+The `grants` block opens TCP 22 at the network layer. The `ssh` block controls whether Tailscale actually allows an SSH session to proceed and which Linux users an admin may log in as.
+
+```json
+"ssh": [
+  {
+    "action": "check",
+    "src":    ["autogroup:admin"],
+    "dst":    ["tag:mis-server"],
+    "users":  ["<linux-admin-user>"]
+  }
+]
+```
+
+Replace `<linux-admin-user>` with the actual Linux account name on the Ubuntu server — for example, `ubuntu` or `misadmin`. The value must match an existing account; Tailscale does not create Linux users.
+
+<Tip>
+  `"action": "check"` means Tailscale **re-authenticates** the admin's identity each time before granting SSH access. No static SSH key is required in `~/.ssh/authorized_keys` for this path. This is the recommended action for production servers because it ties every SSH session to a live, verified tailnet identity.
+</Tip>
+
+---
+
+## Policy Tests
+
+Include a `tests` block in your policy to let Tailscale validate your rules automatically. The admin console runs these tests each time you save the policy and fails the save if any test does not pass.
+
+```json
+"tests": [
+  {
+    "src":    "tag:mis-client",
+    "accept": ["tag:mis-server:1433"],
+    "deny":   ["tag:mis-server:22"]
+  }
+]
+```
+
+This test asserts that:
+- A `tag:mis-client` node **can** reach `tag:mis-server` on port 1433.
+- A `tag:mis-client` node **cannot** reach `tag:mis-server` on port 22.
+
+---
+
+## Complete Recommended Policy
+
+Paste the following JSON into **Access Controls** in the Tailscale Admin Console. Update `<linux-admin-user>` to the real Linux username before saving.
+
+```json
+{
+  "tagOwners": {
+    "tag:mis-server": ["autogroup:admin"],
+    "tag:mis-client": ["autogroup:admin"]
+  },
+  "grants": [
+    {
+      "src": ["tag:mis-client"],
+      "dst": ["tag:mis-server"],
+      "ip":  ["tcp:1433"]
+    },
+    {
+      "src": ["autogroup:admin"],
+      "dst": ["tag:mis-server"],
+      "ip":  ["tcp:22"]
+    }
+  ],
+  "ssh": [
+    {
+      "action": "check",
+      "src":    ["autogroup:admin"],
+      "dst":    ["tag:mis-server"],
+      "users":  ["<linux-admin-user>"]
+    }
+  ],
+  "tests": [
+    {
+      "src":    "tag:mis-client",
+      "accept": ["tag:mis-server:1433"],
+      "deny":   ["tag:mis-server:22"]
+    }
+  ]
+}
+```
+
+---
+
+## Permissions Reference
+
+The table below summarizes the effective access matrix produced by this policy.
+
+| Source | Destination | Port / Access | Result |
+|---|---|---|---|
+| `tag:mis-client` | `tag:mis-server` | TCP 1433 (SQL) | ✅ Allow |
+| `tag:mis-client` | `tag:mis-server` | Tailscale SSH | ❌ Deny |
+| `autogroup:admin` | `tag:mis-server` | Tailscale SSH | ✅ Allow |
+| Other tailnet devices | `tag:mis-server` | TCP 1433 | ❌ Deny |
+| Other tailnet devices | `tag:mis-server` | Tailscale SSH | ❌ Deny |
+| Internet (any) | `mis-server` | TCP 22 or 1433 | 🚫 Not exposed |
+
+---
+
+## Defense-in-Depth: Three Layers
+
+Tailscale ACL alone is not the only safeguard. The MIS production server uses three independent layers, each of which must be bypassed for a breach to occur:
+
+<CardGroup cols={3}>
+  <Card title="Layer 1 — Tailscale" icon="shield-halved">
+    Tag-based grants and SSH policy control identity and network access at the tailnet layer. No unauthenticated node can reach the server at all.
+  </Card>
+  <Card title="Layer 2 — UFW" icon="server">
+    Host firewall rules restrict port 1433 and port 22 to the `tailscale0` interface only. Traffic arriving on any other interface is dropped by the kernel.
+  </Card>
+  <Card title="Layer 3 — SQL Authentication" icon="database">
+    SQL Server still requires valid credentials, correct database name, and appropriate permissions. Network access alone is not enough to read data.
+  </Card>
+</CardGroup>

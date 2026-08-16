@@ -1,0 +1,211 @@
+---
+title: "Configuring a Static IP Address with Netplan on Ubuntu"
+sidebarTitle: "Network"
+description: "Assign a permanent static IP to the MIS server using Netplan, verify LAN connectivity, and understand how to safely apply network changes over SSH."
+---
+
+A static IP address is mandatory for a production database server. MIS clients use the server's IP in their connection strings, backup scripts reference it for NAS mounts, and Tailscale records it as the exit address. If the server's IP changes — because DHCP renewed a different lease — every client, script, and firewall rule that references the old address breaks simultaneously.
+
+This page walks you through identifying your network interface, writing a Netplan configuration, and applying it safely — including what to do when you are connected over SSH and cannot afford to lose the session.
+
+## Identify Your Network Interface
+
+Before you write any configuration, confirm the exact name of the Ethernet interface on your server. Interface names vary by hardware (for example, `enp1s0`, `eno1`, `eth0`).
+
+```bash
+ip -br addr
+ip route
+```
+
+Sample output from `ip -br addr`:
+
+```
+lo               UNKNOWN   127.0.0.1/8 ::1/128
+enp1s0           UP        192.168.1.74/24 ...
+```
+
+Sample output from `ip route`:
+
+```
+default via 192.168.1.1 dev enp1s0 proto dhcp src 192.168.1.74 metric 100
+192.168.1.0/24 dev enp1s0 proto kernel scope link src 192.168.1.74
+```
+
+Note down:
+- **Interface name** — the value in the first column of `ip -br addr` that is `UP` (for example `enp1s0`)
+- **Current IP and subnet** — the address currently assigned (for example `192.168.1.74/24`)
+- **Default gateway** — the `via` address from `ip route` (for example `192.168.1.1`)
+
+<Warning>
+Do not copy the interface name `enp1s0` from this page. Your server hardware will almost certainly use a different name. Using the wrong interface name in Netplan causes the network to stop working entirely.
+</Warning>
+
+## Write the Netplan Configuration
+
+Netplan configuration files live in `/etc/netplan/`. Ubuntu's installer typically creates a file named `00-installer-config.yaml`. You will create (or replace) a file in that directory.
+
+<Steps>
+  <Step title="Open the Netplan Configuration File">
+    ```bash
+    sudoedit /etc/netplan/00-installer-config.yaml
+    ```
+
+    If the file already exists with DHCP content, you will replace it. If it does not exist, you will create it.
+  </Step>
+
+  <Step title="Write the Static IP Configuration">
+    Replace the entire file content with the following, **substituting all placeholder values** with your actual network details:
+
+    ```yaml
+    network:
+      version: 2
+      ethernets:
+        enp1s0:                        # ← Replace with your interface name
+          dhcp4: false
+          addresses:
+            - 192.168.1.74/24          # ← Replace with your chosen static IP/prefix
+          routes:
+            - to: default
+              via: 192.168.1.1         # ← Replace with your gateway IP
+          nameservers:
+            addresses:
+              - 192.168.1.1            # ← Replace with your primary DNS (often the gateway)
+              - 1.1.1.1                # ← Replace with your secondary DNS
+    ```
+
+    <Warning>
+    Every value in this file is a placeholder. You **must** replace:
+    - `enp1s0` → your actual interface name from `ip -br addr`
+    - `192.168.1.74/24` → your chosen static IP and subnet mask
+    - `192.168.1.1` (gateway) → your actual default gateway
+    - DNS addresses → your actual DNS resolvers
+
+    Copying this file verbatim will either break networking or assign the wrong IP to the server.
+    </Warning>
+  </Step>
+
+  <Step title="Set Correct File Permissions">
+    Netplan files must not be world-readable (they can contain credentials in some configurations). Set restrictive permissions:
+
+    ```bash
+    sudo chmod 600 /etc/netplan/00-installer-config.yaml
+    ```
+  </Step>
+</Steps>
+
+## Apply the Configuration Safely
+
+The order of these commands matters. If you are connected to the server over SSH and you apply a broken configuration, you lose your session and cannot recover without physical console access.
+
+<Warning>
+Always use `netplan try` before `netplan apply` when you are connected remotely over SSH. `netplan try` applies the configuration temporarily and automatically reverts it after 120 seconds if you do not confirm. This gives you a safe window to test connectivity before committing the change.
+</Warning>
+
+<Steps>
+  <Step title="Validate the Configuration Syntax">
+    ```bash
+    sudo netplan generate
+    ```
+
+    This command validates the YAML syntax and generates the underlying NetworkManager or systemd-networkd configuration files. Fix any errors it reports before proceeding.
+  </Step>
+
+  <Step title="Apply Temporarily with Automatic Rollback">
+    ```bash
+    sudo netplan try
+    ```
+
+    Netplan applies the configuration and starts a 120-second countdown. Your terminal shows:
+
+    ```
+    Do you want to keep these settings?
+    Press ENTER before the countdown expires to accept the new configuration
+    ```
+
+    **Do not press ENTER yet.** Open a second terminal and test connectivity first.
+  </Step>
+
+  <Step title="Test Connectivity in a New SSH Session">
+    Open a **new** SSH session to the server using the new static IP:
+
+    ```bash
+    ssh <admin-user>@192.168.1.74   # Use the new static IP
+    ```
+
+    Also confirm outbound routing:
+
+    ```bash
+    ping -c 3 1.1.1.1
+    ping -c 3 google.com
+    ```
+
+    If both succeed, the configuration is correct.
+
+    <Tip>
+    Keep your original SSH session open during this test. If the new session cannot connect, the original session will stay alive and `netplan try` will automatically revert after 120 seconds — restoring your old IP and letting you fix the configuration.
+    </Tip>
+  </Step>
+
+  <Step title="Confirm or Revert">
+    **If the new session connected successfully:** return to the original terminal and press **ENTER** to commit the configuration permanently.
+
+    **If the new session failed to connect:** do nothing. Wait for the 120-second countdown to expire. Netplan reverts to the previous configuration automatically, and your original session remains connected.
+  </Step>
+
+  <Step title="Apply Permanently">
+    After confirming with ENTER, run:
+
+    ```bash
+    sudo netplan apply
+    ```
+
+    This commits the change so it persists across reboots. Verify the applied address:
+
+    ```bash
+    ip -br addr
+    ip route
+    ```
+
+    The output should show your new static IP on the correct interface, with the correct default route.
+  </Step>
+</Steps>
+
+## Verify DNS Resolution
+
+Confirm that name resolution works correctly before proceeding. SQL Server repository setup and NTP synchronisation both require DNS.
+
+```bash
+# Test DNS resolution against your configured resolvers
+dig google.com
+nslookup google.com
+
+# Confirm outbound connectivity
+ping -c 3 1.1.1.1
+ping -c 3 8.8.8.8
+```
+
+<Note>
+If `ping 1.1.1.1` succeeds but `ping google.com` fails, the problem is DNS-specific — check your `nameservers` values in the Netplan config. If both fail, the problem is routing — check the `routes.via` gateway address.
+</Note>
+
+## Reserve the IP on Your Router
+
+After you confirm the static IP is working on the server, log into your router or DHCP server and create a **DHCP reservation** (also called a static lease) that maps the server's MAC address to its chosen IP address. This prevents a DHCP client on another machine from accidentally claiming the same IP if the server's Netplan config is ever lost.
+
+```bash
+# Find the server's MAC address
+ip link show <your-interface-name>
+```
+
+Record the MAC address (shown as `link/ether xx:xx:xx:xx:xx:xx`) and add the reservation in your router's admin panel.
+
+## Checklist Before Moving On
+
+- [ ] Interface name confirmed with `ip -br addr`
+- [ ] Netplan file contains your actual IP, gateway, DNS (no placeholder values)
+- [ ] `sudo netplan generate` completed with no errors
+- [ ] `sudo netplan try` + new SSH session test passed
+- [ ] `sudo netplan apply` committed the change
+- [ ] `ip -br addr` shows correct static IP on the correct interface
+- [ ] `ping -c 3 1.1.1.1` and `ping -c 3 google.com` both succeed
+- [ ] MAC-based DHCP reservation added on the router

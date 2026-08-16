@@ -1,0 +1,131 @@
+---
+title: "SQL Server Install & Query Command Reference"
+sidebarTitle: "SQL Commands"
+description: "Step-by-step bash and T-SQL commands to install SQL Server 2025 Express on Ubuntu 24.04, verify the instance, and inspect databases with sqlcmd."
+---
+
+This page covers every command needed to add the Microsoft package repository, install SQL Server 2025 Express, install `sqlcmd`, and run the most common diagnostic queries against a running instance. Commands are grouped in execution order so you can follow them top-to-bottom during an initial deployment, or jump to any individual section during troubleshooting.
+
+## Add the Microsoft Package Repository
+
+Run both `curl` commands before calling `apt update`. The first adds the Microsoft signing key; the second adds the package list.
+
+```bash
+# Import the Microsoft GPG signing key
+curl -fsSL https://packages.microsoft.com/keys/microsoft.asc \
+  | sudo gpg --dearmor -o /usr/share/keyrings/microsoft-prod.gpg
+
+# Add the Ubuntu 24.04 Microsoft package source
+curl -fsSL https://packages.microsoft.com/config/ubuntu/24.04/prod.list \
+  | sudo tee /etc/apt/sources.list.d/microsoft-prod.list >/dev/null
+
+# Refresh the package cache to include the new source
+sudo apt update
+```
+
+## Install SQL Server
+
+The `ACCEPT_EULA=Y` environment variable is required — the installer will exit immediately without it.
+
+```bash
+sudo ACCEPT_EULA=Y apt install -y mssql-server
+```
+
+## Run the Setup Wizard
+
+`mssql-conf setup` lets you choose an edition and set the `sa` password. Select **Express** when prompted for the edition.
+
+```bash
+sudo /opt/mssql/bin/mssql-conf setup
+```
+
+## Enable and Start mssql-server
+
+```bash
+sudo systemctl enable --now mssql-server
+```
+
+After running this command, verify the service came up cleanly:
+
+```bash
+systemctl status mssql-server --no-pager
+```
+
+## Install sqlcmd and ODBC Driver
+
+`mssql-tools18` provides the `sqlcmd` binary. `unixodbc-dev` is required by the ODBC driver that the tools depend on.
+
+```bash
+sudo ACCEPT_EULA=Y apt install -y mssql-tools18 unixodbc-dev
+```
+
+<Tip>
+  Add `/opt/mssql-tools18/bin` to your `PATH` so you can run `sqlcmd` without the full path:
+
+  ```bash
+  echo 'export PATH="$PATH:/opt/mssql-tools18/bin"' >> ~/.bashrc && source ~/.bashrc
+  ```
+</Tip>
+
+## Connect with sqlcmd
+
+The `-C` flag trusts the self-signed TLS certificate that SQL Server generates on first start. Replace `sa` with a less privileged login once your setup is complete.
+
+```bash
+# Connect to the local instance as sa
+# You will be prompted for the sa password
+/opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -C
+```
+
+---
+
+## Diagnostic T-SQL Queries
+
+Run these queries from inside a `sqlcmd` session or from any connected SQL client (SSMS, Azure Data Studio, etc.).
+
+### Confirm SQL Server Version and Edition
+
+```sql
+SELECT @@VERSION AS sql_version, SERVERPROPERTY('Edition') AS edition;
+GO
+```
+
+### List All Databases and Their States
+
+```sql
+SELECT name, state_desc, recovery_model_desc
+FROM sys.databases;
+GO
+```
+
+The MIS database must show `state_desc = ONLINE` before you allow clients to connect.
+
+### List Database Physical Files
+
+```sql
+SELECT
+  DB_NAME(database_id) AS database_name,
+  type_desc,
+  physical_name
+FROM sys.master_files
+ORDER BY database_name, file_id;
+GO
+```
+
+Use this query to confirm that data and log files landed in `/var/opt/mssql/data/` as expected after a restore.
+
+### Check Database Sizes
+
+```sql
+SELECT
+  DB_NAME(database_id) AS database_name,
+  SUM(size) * 8.0 / 1024 AS size_mb
+FROM sys.master_files
+GROUP BY database_id
+ORDER BY size_mb DESC;
+GO
+```
+
+<Note>
+  SQL Server Express has a maximum database size of 10 GB. Monitor `size_mb` for the MIS database and plan a license upgrade if usage approaches that limit.
+</Note>

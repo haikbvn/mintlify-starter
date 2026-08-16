@@ -1,0 +1,213 @@
+---
+title: "MIS Client Onboarding and Offboarding with Tailscale"
+sidebarTitle: "Client Onboarding"
+description: "Step-by-step guide to enrolling new MIS workstations in the Tailscale tailnet, assigning the correct tag, validating SQL connectivity, and safely revoking access."
+---
+
+Every MIS client machine that needs to reach the production SQL Server must be enrolled in the Tailscale tailnet and assigned the `tag:mis-client` tag. The existing ACL grant automatically extends TCP 1433 access to any machine carrying that tag — you never need to modify the ACL policy to add a new client. This page covers the full lifecycle: enrolling a new machine, verifying connectivity, revoking a departing machine, and managing admin access.
+
+---
+
+## Enroll a New MIS Client Machine
+
+<Steps>
+
+  <Step title="Install Tailscale on the client">
+    Download and install Tailscale for the client's operating system from [tailscale.com/download](https://tailscale.com/download). On Windows, run the installer and follow the prompts.
+
+    <Note>
+      On Windows, Tailscale installs a system tray application. You can also install it silently for managed deployments using the MSI package and Group Policy or your MDM solution.
+    </Note>
+  </Step>
+
+  <Step title="Join the tailnet">
+    Open Tailscale on the client and sign in with the organization's identity provider. The machine appears in the Tailscale Admin Console under **Machines** once authentication completes.
+
+    If you are pre-tagging the machine at enrollment, run the following from an elevated command prompt or PowerShell on Windows:
+
+    ```powershell
+    tailscale up --advertise-tags=tag:mis-client
+    ```
+
+    On macOS or Linux clients:
+
+    ```bash
+    sudo tailscale up --advertise-tags=tag:mis-client
+    ```
+  </Step>
+
+  <Step title="Confirm the machine appears in the admin console">
+    Open the [Tailscale Admin Console](https://login.tailscale.com/admin/machines) and locate the new machine. Verify it shows a `100.x.x.x` IP address and an **Online** status before proceeding.
+  </Step>
+
+  <Step title="Assign the tag:mis-client tag">
+    In the Admin Console, open the machine's details page, click **Edit tags**, and add `tag:mis-client`.
+
+    <Warning>
+      Do **not** assign `tag:mis-server` or any admin-level tag to a client machine. The `tag:mis-server` tag grants no extra user permissions on its own, but keeping tags accurate is essential for the ACL policy to remain meaningful.
+    </Warning>
+  </Step>
+
+  <Step title="Verify Tailscale reachability">
+    From the newly enrolled client, confirm the server is reachable over the tailnet:
+
+    <CodeGroup>
+      ```powershell Windows
+      tailscale ping mis-server
+      ```
+
+      ```bash macOS / Linux
+      tailscale ping mis-server
+      ```
+    </CodeGroup>
+
+    A successful ping confirms the Tailscale connection is up and MagicDNS is resolving the server hostname.
+  </Step>
+
+  <Step title="Test TCP 1433 connectivity">
+    Verify that port 1433 is reachable from the client before attempting a SQL login:
+
+    <CodeGroup>
+      ```powershell Windows
+      Test-NetConnection mis-server -Port 1433
+      ```
+
+      ```bash macOS / Linux
+      # Using nc (netcat):
+      nc -zv mis-server 1433
+      ```
+    </CodeGroup>
+
+    On Windows, you are looking for `TcpTestSucceeded : True` in the output. A TCP pass confirms network-layer access — it does not confirm SQL authentication.
+
+    <Tip>
+      If `Test-NetConnection` returns `TcpTestSucceeded : False`, check that the machine has the `tag:mis-client` tag assigned in the Admin Console and that the ACL policy has been saved. Changes take effect within seconds but require the tag to be present.
+    </Tip>
+  </Step>
+
+  <Step title="Confirm SQL login and MIS application">
+    Open the MIS application or a SQL client and connect using the MagicDNS hostname as the server address:
+
+    ```
+    mis-server,1433
+    ```
+
+    If MagicDNS is not yet resolving on the client, fall back to the server's Tailscale IP temporarily:
+
+    ```
+    100.x.x.x,1433
+    ```
+
+    Verify that:
+    - The SQL login succeeds with the correct credentials.
+    - The expected database is accessible.
+    - The MIS application connects and loads data.
+
+    <Note>
+      TCP port access, SQL authentication, and application-level permissions are three separate checks. A successful `Test-NetConnection` only confirms the first. You must validate all three before considering onboarding complete.
+    </Note>
+  </Step>
+
+</Steps>
+
+---
+
+## Verify SSH Is Correctly Blocked on Clients
+
+MIS clients must **not** be able to SSH into the server. Confirm this explicitly after onboarding:
+
+```powershell
+# Expect TcpTestSucceeded : False for port 22 from an MIS client
+Test-NetConnection mis-server -Port 22
+```
+
+If this returns `True` from a client machine, review your ACL policy — the `tag:mis-client` grant must not include TCP 22.
+
+---
+
+## Revoke a Departing MIS Client Machine
+
+When a workstation is decommissioned or a user leaves, remove its access promptly to maintain the principle of least privilege.
+
+<Steps>
+
+  <Step title="Remove or expire the device in Tailscale">
+    In the [Tailscale Admin Console](https://login.tailscale.com/admin/machines), find the machine and select **Remove** (to permanently delete it) or set a key expiry to force re-authentication. Once the device is removed, it can no longer connect to the tailnet.
+  </Step>
+
+  <Step title="Alternatively, remove only the tag">
+    If the machine stays in the tailnet for other purposes but should no longer reach SQL Server, edit its tags and remove `tag:mis-client`. The TCP 1433 grant no longer applies.
+  </Step>
+
+  <Step title="Rotate SQL credentials if the machine had its own login">
+    If the departing machine used a dedicated SQL Server login, disable or drop that login and rotate any shared credentials as a precaution.
+
+    ```sql
+    -- Disable a SQL login (SQL Server authentication)
+    ALTER LOGIN [mis_app_user] DISABLE;
+
+    -- Or drop it entirely if it is no longer needed
+    DROP LOGIN [mis_app_user];
+    ```
+  </Step>
+
+  <Step title="Verify TCP 1433 is now denied">
+    If possible, confirm from the removed machine (or a test machine without `tag:mis-client`) that port 1433 is no longer reachable:
+
+    ```powershell
+    Test-NetConnection mis-server -Port 1433
+    # Expected: TcpTestSucceeded : False
+    ```
+  </Step>
+
+</Steps>
+
+---
+
+## Add or Revoke Admin Access
+
+Admin rights in this setup are tied entirely to `autogroup:admin` membership in the tailnet identity provider — not to SSH keys on the server. This means onboarding and offboarding admins requires no server-side changes.
+
+<CardGroup cols={2}>
+  <Card title="Add an admin" icon="user-plus">
+    Grant the user admin rights in your tailnet identity provider (the Tailscale account owner or your SSO provider). Their devices automatically join `autogroup:admin` and gain Tailscale SSH access to `tag:mis-server` per the ACL policy.
+  </Card>
+  <Card title="Revoke an admin" icon="user-minus">
+    Remove the admin role from the user's tailnet identity. Their devices immediately leave `autogroup:admin`. Verify that `ssh <user>@mis-server` is denied from their machine after the change.
+  </Card>
+</CardGroup>
+
+<Note>
+  Because Tailscale SSH uses `"action": "check"`, each SSH session requires the admin's identity to be valid at the time of connection. Revoking the admin role takes effect for new sessions immediately — there is no need to remove SSH keys from the server.
+</Note>
+
+---
+
+## MIS SQL Connection String Reference
+
+Use the following connection string formats in the MIS application configuration:
+
+| Scenario | Server / Host value | Notes |
+|---|---|---|
+| MagicDNS (preferred) | `mis-server,1433` | Stable across server rebuilds |
+| Full MagicDNS hostname | `mis-server.<tailnet>.ts.net,1433` | Use when short name does not resolve |
+| Tailscale IP (fallback) | `100.x.x.x,1433` | Use only if MagicDNS is not resolving |
+
+<Tip>
+  Always prefer the MagicDNS hostname over a hard-coded IP. If you replace or rebuild the server, the Tailscale IP may change, but the MagicDNS hostname remains the same as long as the machine name stays `mis-server`.
+</Tip>
+
+---
+
+## Quick Reference: Onboarding Checklist
+
+Use this checklist each time you enroll a new MIS client:
+
+- [ ] Tailscale installed and signed in to the correct tailnet
+- [ ] Machine visible in the Admin Console with `Online` status
+- [ ] `tag:mis-client` assigned (no admin tags assigned)
+- [ ] `tailscale ping mis-server` succeeds
+- [ ] `Test-NetConnection mis-server -Port 1433` → `TcpTestSucceeded : True`
+- [ ] `Test-NetConnection mis-server -Port 22` → `TcpTestSucceeded : False`
+- [ ] SQL login and database access confirmed
+- [ ] MIS application connects and loads data successfully
