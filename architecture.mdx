@@ -8,40 +8,6 @@ The MIS production server is a single physical machine running Ubuntu Server 24.
 
 ## Component Map
 
-```mermaid
----
-config:
-  layout: elk
----
-graph TD
-    misServer["<b>MIS Server</b><br/>hostname: mis-server"]
-    sqlServer["<b>SQL Server 2025 Express</b><br/>TCP :1433<br/>(native, no Docker)"]
-    systemdServices["<b>systemd services</b><br/>· mssql-server<br/>· tailscaled<br/>· ufw<br/>· ssh"]
-    storage["<b>Storage</b><br/>· OS NVMe/SSD<br/>  (/var/opt/mssql +<br/>   /srv/sqlbackup)<br/>· NAS mount<br/>  (/mnt/nas-backup)"]
-    
-    windowsClients["<b>Windows MIS Clients</b><br/>(LAN)"]
-    remoteClient["<b>Windows MIS Client</b><br/>(remote / Tailscale)"]
-    admin["<b>Administrator</b><br/>(shell access only)"]
-    
-    misServer --> sqlServer
-    misServer --> systemdServices
-    misServer --> storage
-    
-    windowsClients -->|"LAN TCP 1433"| sqlServer
-    remoteClient -->|"Tailscale TCP 1433/22"| misServer
-    remoteClient -->|"Tailscale SSH :22"| admin
-    
-    classDef server stroke:#818cf8,fill:#eef2ff
-    classDef component stroke:#a78bfa,fill:#f5f3ff
-    classDef client stroke:#2dd4bf,fill:#f0fdfa
-    classDef admin stroke:#fb7185,fill:#fff1f2
-    
-    class misServer server
-    class sqlServer,systemdServices,storage component
-    class windowsClients,remoteClient client
-    class admin admin
-```
-
 ```text
 ┌─────────────────────────────────────────────────────────────┐
 │                        MIS Server                           │
